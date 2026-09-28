@@ -244,10 +244,23 @@ fn retire_cursor(
             continue;
         }
         let covered = match cell_of(x0, y0, row_h, cx, y) {
-            Some((col, row)) => e
-                .glyphs
-                .iter()
-                .any(|g| g.row == row && col >= g.col && col < g.col + g.w),
+            Some((col, row)) => e.glyphs.iter().take(e.typed).any(|g| {
+                if g.row != row || col < g.col || col >= g.col + g.w {
+                    return false;
+                }
+                match &g.canvas {
+                    // Terminal font: the character fills its one cell.
+                    None => true,
+                    // Pixel font: a glyph only covers the cells it actually
+                    // lights, so its unlit columns still show through.
+                    Some(cv) => cv
+                        .rows
+                        .get(y.saturating_sub(y0).saturating_sub(row * row_h))
+                        .and_then(|r| r.get(col - g.col))
+                        .copied()
+                        .unwrap_or(false),
+                }
+            }),
             None => false,
         };
         if !covered {
@@ -419,6 +432,10 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     }
     if e.pin {
         s.value(o, y, "pinned", hot);
+    }
+    if let Some((msg, left)) = &e.notice {
+        let fade = (left / 0.6).clamp(0.0, 1.0);
+        s.value(o, y, msg, style::mix(BG, GREEN, a * fade));
     }
 
     let right = format!("cycle {:02}  {}", e.cycle, clock(e.elapsed));

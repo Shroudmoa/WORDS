@@ -107,6 +107,9 @@ pub struct Engine {
     pub pin: bool,
     pub hud: f64,
     pub hud_target: f64,
+    /// A short message for the control strip -- currently only "RELOADED" --
+    /// with the seconds it has left to show.
+    pub notice: Option<(String, f64)>,
     pub full: bool,
     /// Where the last painted cursor sat, as `(x, y, cells tall)`. The terminal
     /// has no per-frame clear, and the cursor moves with every keystroke, so the
@@ -164,6 +167,7 @@ impl Engine {
             pin: false,
             hud: 0.0,
             hud_target: 1.0,
+            notice: None,
             full: true,
             hud_block: None,
             overlay: None,
@@ -256,10 +260,32 @@ impl Engine {
     /// to the small font rather than truncate, and only ever clip a phrase that
     /// won't fit at the small font either (a very short window, say).
     fn load(&mut self, idx: usize) {
-        self.idx = idx;
-        let text = phrases::ascii(&self.phrases[idx]);
-        let max_w = self.max_text_cols();
         let pixel = self.pixel;
+        let n = self.phrases.len();
+        if n == 0 {
+            return;
+        }
+        // A phrase the current font has no way to show -- the pixel font has no
+        // Cyrillic, say -- is stepped over rather than rendered as a blank, and
+        // an undisplayable list leaves the current phrase alone.
+        let mut idx = idx % n;
+        let text = loop {
+            let t = if pixel {
+                phrases::ascii(&self.phrases[idx])
+            } else {
+                phrases::screen(&self.phrases[idx])
+            };
+            if !t.is_empty() {
+                break t;
+            }
+            let next = (idx + 1) % n;
+            if next == idx {
+                return;
+            }
+            idx = next;
+        };
+        self.idx = idx;
+        let max_w = self.max_text_cols();
 
         // Try the requested scale, then the small one. A scale that shows the
         // whole phrase always wins; failing that, show as much as possible and
@@ -398,6 +424,13 @@ impl Engine {
         }
 
         self.hud += (self.hud_target - self.hud) * (dt * 7.0).min(1.0);
+
+        if let Some((_, left)) = &mut self.notice {
+            *left -= dt;
+            if *left <= 0.0 {
+                self.notice = None;
+            }
+        }
 
         match self.phase {
             Phase::Boot => {
@@ -553,9 +586,30 @@ impl Engine {
         self.phrases = v;
         self.vis = 0.0;
         self.vis_target = 1.0;
-        self.cycle = 1;
         self.load(0);
         self.phase = Phase::Typing;
+    }
+
+    /// Swap in a whole set of phrase sections, mixed into one cycle.
+    pub fn use_sections(&mut self, secs: &[phrases::Section]) {
+        let cycle = phrases::mix(secs, &mut self.rand);
+        self.use_phrases(cycle);
+    }
+
+    /// Take on a new phrase set without restarting the session clock, and say so
+    /// in the control strip for a couple of seconds.
+    pub fn reload(&mut self, secs: &[phrases::Section]) {
+        let cycle = self.cycle;
+        let elapsed = self.elapsed;
+        self.use_sections(secs);
+        self.cycle = cycle;
+        self.elapsed = elapsed;
+        self.notice = Some(("RELOADED".to_string(), 2.5));
+        // Bring the control strip up, since the whole point is that you just
+        // edited the file in another window.
+        self.idle = 0.0;
+        self.hud_target = 1.0;
+        self.kick();
     }
 
     // -- derived layout ------------------------------------------------------
@@ -1117,30 +1171,33 @@ mod tests {
             out
         }
 
-        let mut e = eng(60, 20);
-        e.use_phrases(vec!["STAY A LITTLE LONGER".into()]);
-        let mut prev = None;
         let mut moves = 0;
+        for pixel in [false, true] {
+            let mut e = eng(100, 40);
+            e.pixel = pixel;
+            e.use_phrases(vec!["STAY A LITTLE LONGER".into()]);
+            let mut prev = None;
 
-        while e.typed < e.glyphs.len() {
-            e.update(1.0 / 60.0);
-            let mut o = Out::new();
-            view::draw(&mut e, &mut o);
+            while e.typed < e.glyphs.len() {
+                e.update(1.0 / 60.0);
+                let mut o = Out::new();
+                view::draw(&mut e, &mut o);
 
-            if let Some((px, py)) = prev {
-                let frame = String::from_utf8_lossy(&o.0);
-                let repainted = touched(&frame)
-                    .iter()
-                    .any(|&(r, c, n)| r == py && c <= px && px < c + n);
-                assert!(
-                    repainted,
-                    "the cursor left cell ({px},{py}) lit and nothing repainted it"
-                );
-                moves += 1;
+                if let Some((px, py)) = prev {
+                    let frame = String::from_utf8_lossy(&o.0);
+                    let repainted = touched(&frame)
+                        .iter()
+                        .any(|&(r, c, n)| r == py && c <= px && px < c + n);
+                    assert!(
+                        repainted,
+                        "pixel={pixel}: cursor left ({px},{py}) lit, nothing repainted it"
+                    );
+                    moves += 1;
+                }
+                prev = e.cursor_at.map(|(x, y, _)| (x, y));
             }
-            prev = e.cursor_at.map(|(x, y, _)| (x, y));
         }
-        assert!(moves >= 15, "the cursor really did travel: {moves} moves");
+        assert!(moves >= 30, "the cursor really did travel: {moves} moves");
     }
 
     /// The boot overlay is painted before the text layer has a footprint to
