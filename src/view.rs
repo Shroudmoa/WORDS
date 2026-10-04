@@ -1,6 +1,6 @@
 //! Drawing. One frame = one string of escape codes, flushed in a single write.
 
-use crate::engine::{Engine, Glyph, Phase};
+use crate::engine::{Engine, Glyph, Mode, Phase};
 use crate::style::{self, Rgb};
 use crate::term::Out;
 use crate::style::{AMBER, BG, CYAN, DIM, FAINT, FG, GREEN, GLITCH_COLORS, MAGENTA};
@@ -81,8 +81,18 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
     let (x0, y0) = e.origin();
     let bw = e.block_width();
     let bh = e.block_size().1;
+    let gh = e.glyph_size();
     let row_h = e.line_h();
     let turbulent = e.glitch > 0.0;
+    let caption = e.label_text();
+
+    // The alarm owns the colour of the whole clock -- a five-hertz amber and
+    // magenta strobe. It also has to force a repaint, because a terminal holds
+    // whatever colour it was last handed and would just keep the first one.
+    let alarming = e.mode == Mode::Timer && e.timer.alarming();
+    if alarming {
+        e.full = true;
+    }
 
     // Any repaint starts by wiping the previous frame's footprint. The wipe is
     // padded, and the frame *after* a burst repaints too, so nothing outlives
@@ -122,11 +132,23 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
         .collect();
 
     let vis = ease(e.vis);
-    let base = style::mix(BG, FG, vis);
+    let mut base = style::mix(BG, FG, vis);
+    if alarming {
+        base = if (e.elapsed * 5.0).fract() < 0.5 {
+            AMBER
+        } else {
+            MAGENTA
+        };
+    }
     let visible = e.typed.min(e.glyphs.len());
+    // The digit that just ticked keeps repainting while its flash decays. Its
+    // pixels are already down, so recolouring them costs a handful of cells --
+    // far less than repainting the clock to change one of them.
+    let lit = e.flash_glyph;
+    let fading = e.flash > 0.0;
 
     for i in 0..visible {
-        if i < e.painted_upto {
+        if i < e.painted_upto && !(fading && i == lit) {
             continue;
         }
         let (col, row) = {
@@ -150,6 +172,8 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
 
         let color = if turbulent && e.rand.chance(0.25) {
             GLITCH_COLORS[e.rand.below(GLITCH_COLORS.len())]
+        } else if fading && i == lit {
+            style::mix(base, CYAN, e.flash)
         } else {
             base
         };
@@ -162,7 +186,16 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
         }
         paint(&e.glyphs[i], o, cols, x, y, color);
         e.glyphs[i].at = Some((x, y));
-        e.painted_upto = i + 1;
+        e.painted_upto = e.painted_upto.max(i + 1);
+    }
+
+    // The caption, inside the block's footprint so the wipe above takes it too.
+    if let Some(t) = &caption {
+        let lx = x0 + bw.saturating_sub(t.chars().count()) / 2;
+        let ly = y0 + gh;
+        if ly < rows {
+            write_text(o, cols, lx, ly, t, style::mix(BG, CYAN, ease(e.vis)));
+        }
     }
 
     e.block = Some((x0, y0, bw, bh));
@@ -171,7 +204,10 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
         noise(e, o, x0, y0, bw, bh);
     }
 
-    cursor(e, o, x0, y0, row_h, cols, rows);
+    // A cursor after the last digit of a clock would only read as a typo.
+    if e.mode == Mode::Words {
+        cursor(e, o, x0, y0, row_h, cols, rows);
+    }
 }
 
 /// Paint one glyph. The terminal font puts down the character itself; the pixel
@@ -348,7 +384,19 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
     let y = (y0 + bh + 2).min(rows.saturating_sub(4));
     let w = cols.saturating_sub(14).max(8);
     let x = (cols - w) / 2;
-    let frac = if e.glyphs.is_empty() {
+
+    // What the bar is claiming. Words are filling up towards the end of a
+    // phrase, a countdown is draining towards zero, and a stopwatch has no end
+    // to fill towards at all -- so it says nothing and moves instead.
+    let mut sweep = false;
+    let frac = if e.mode == Mode::Timer {
+        if e.timer.down && e.timer.total > 0.0 {
+            (1.0 - e.timer.value / e.timer.total).clamp(0.0, 1.0)
+        } else {
+            sweep = true;
+            0.0
+        }
+    } else if e.glyphs.is_empty() {
         0.0
     } else {
         e.typed as f64 / e.glyphs.len() as f64
@@ -363,10 +411,22 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
     style::cells(o, x - 2, y, 1, cap);
     style::cells(o, x - 1, y, 1, track);
     style::cells(o, x, y, w, track);
-    let fill = ((w as f64 * frac).round() as usize).min(w);
-    style::cells(o, x, y, fill, fill_c);
-    if fill > 0 {
-        style::cells(o, x + fill - 1, y, 1, head);
+    if sweep {
+        // A ping-pong head rather than a fill, so a stopwatch never implies it
+        // is heading somewhere.
+        let t = (e.elapsed * 0.28) % 2.0;
+        let p = if t > 1.0 { 2.0 - t } else { t };
+        let hx = x + (w as f64 * p).round() as usize;
+        if hx < w {
+            style::cells(o, hx, y, 1, fill_c);
+            style::cells(o, (hx + 1).min(w - 1), y, 1, head);
+        }
+    } else {
+        let fill = ((w as f64 * frac).round() as usize).min(w);
+        style::cells(o, x, y, fill, fill_c);
+        if fill > 0 {
+            style::cells(o, x + fill - 1, y, 1, head);
+        }
     }
     style::cells(o, x + w, y, 1, track);
     style::cells(o, x + w + 1, y, 1, cap);
@@ -411,34 +471,28 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     let lbl = style::mix(BG, DIM, a);
     let val = style::mix(BG, FG, a);
     let key = style::mix(BG, FAINT, a.max(0.3));
-    let hot = style::mix(BG, AMBER, a);
-    let phase_c = match e.phase {
-        Phase::Holding => style::mix(BG, GREEN, a),
-        Phase::Gap | Phase::Resting => style::mix(BG, DIM, a),
-        _ => style::mix(BG, MAGENTA, a),
-    };
 
     let mut s = Strip { x: 2, cols };
-    s.value(o, y, e.phase.label(), phase_c);
-    s.value(o, y, &format!("{:.1}", e.cps()), val);
-    s.label(o, y, "cps", lbl);
-    let hold = if e.phase == Phase::Holding { e.hold } else { e.hold_total };
-    s.label(o, y, "hold", lbl);
-    s.value(o, y, &format!("{:.1}s", hold), val);
-    s.label(o, y, "rate", lbl);
-    s.value(o, y, &format!("{:.0}%", e.level), val);
-    if e.rapid {
-        s.value(o, y, "auto", hot);
+    if e.mode == Mode::Timer {
+        strip_timer(e, o, &mut s, y, cols, a, lbl, val);
+    } else {
+        strip_words(e, o, &mut s, y, cols, a, lbl, val);
     }
     if e.pin {
-        s.value(o, y, "pinned", hot);
+        s.value(o, y, "pinned", style::mix(BG, AMBER, a));
     }
     if let Some((msg, left)) = &e.notice {
         let fade = (left / 0.6).clamp(0.0, 1.0);
         s.value(o, y, msg, style::mix(BG, GREEN, a * fade));
     }
 
-    let right = format!("cycle {:02}  {}", e.cycle, clock(e.elapsed));
+    // `cycle` counts phrases, so in timer mode it has nothing to say; the
+    // direction the clock is running is the more useful thing in that spot.
+    let right = if e.mode == Mode::Timer {
+        format!("{}  {}", e.timer_label(), clock(e.elapsed))
+    } else {
+        format!("cycle {:02}  {}", e.cycle, clock(e.elapsed))
+    };
     let rx = cols.saturating_sub(right.chars().count() + 2);
     if rx > s.x + 2 {
         write_text(o, cols, rx, y, &right, style::mix(BG, CYAN, a));
@@ -446,12 +500,79 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         let kx = s.x + 2;
         let avail = rx.saturating_sub(kx + 2);
         if avail > 16 {
-            let hints =
-                "w/s speed  space next  f font  r auto  g glitch  h help  q quit";
+            let hints = if e.mode == Mode::Timer {
+                "space run/pause  c clear  u direction  +/- length  t words  q quit"
+            } else {
+                "w/s speed  space next  f font  r auto  g glitch  h help  q quit"
+            };
             let h: String = hints.chars().take(avail).collect();
             write_text(o, cols, kx, y, h.trim_end(), key);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strip_words(
+    e: &Engine,
+    o: &mut Out,
+    s: &mut Strip,
+    y: usize,
+    _cols: usize,
+    a: f64,
+    lbl: Rgb,
+    val: Rgb,
+) {
+    let hot = style::mix(BG, AMBER, a);
+    let phase_c = match e.phase {
+        Phase::Holding => style::mix(BG, GREEN, a),
+        Phase::Gap | Phase::Resting => style::mix(BG, DIM, a),
+        _ => style::mix(BG, MAGENTA, a),
+    };
+    s.value(o, y, e.phase.label(), phase_c);
+    s.value(o, y, &format!("{:.1}", e.cps()), val);
+    s.label(o, y, "cps", lbl);
+    let hold = if e.phase == Phase::Holding { e.hold } else { e.hold_total };
+    s.label(o, y, "hold", lbl);
+    s.value(o, y, &format!("{hold:.1}s"), val);
+    s.label(o, y, "rate", lbl);
+    s.value(o, y, &format!("{:.0}%", e.level), val);
+    if e.rapid {
+        s.value(o, y, "auto", hot);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strip_timer(
+    e: &Engine,
+    o: &mut Out,
+    s: &mut Strip,
+    y: usize,
+    _cols: usize,
+    a: f64,
+    lbl: Rgb,
+    val: Rgb,
+) {
+    let state_c = match e.phase {
+        Phase::Running => style::mix(BG, GREEN, a),
+        Phase::Ready | Phase::Paused => style::mix(BG, AMBER, a),
+        Phase::Done => style::mix(BG, MAGENTA, a),
+        _ => lbl,
+    };
+    // The number is the point, so it goes first and largest; the state label
+    // follows, because it is what you actually act on.
+    s.value(o, y, &Engine::hms(e.timer.value), val);
+    s.label(o, y, if e.timer.down { "left" } else { "elapsed" }, lbl);
+    if e.timer.down {
+        s.label(o, y, "set", lbl);
+        s.value(o, y, &Engine::hms(e.timer.total), val);
+    }
+    s.value(o, y, e.phase.label(), state_c);
+    s.label(
+        o,
+        y,
+        if e.timer.down { "countdown" } else { "count up" },
+        lbl,
+    );
 }
 
 fn clock(secs: f64) -> String {
@@ -486,18 +607,43 @@ fn boot(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
 
 // -- help panel -------------------------------------------------------------
 
-const HELP: &[(&str, &str)] = &[
-    ("W / UP", "faster strokes"),
-    ("S / DOWN", "slower strokes"),
-    ("SPACE", "skip to next phrase"),
-    ("LEFT / RIGHT", "previous / next"),
+const HELP_SHARED: &[(&str, &str)] = &[
     ("F", "terminal font / pixel font"),
-    ("R", "auto-ramp the speed"),
     ("G", "force a glitch"),
     ("B", "pin the control bar"),
     ("H", "close this panel"),
     ("Q", "quit"),
 ];
+
+const HELP_WORDS: &[(&str, &str)] = &[
+    ("W / UP", "faster strokes"),
+    ("S / DOWN", "slower strokes"),
+    ("SPACE", "skip to next phrase"),
+    ("LEFT / RIGHT", "previous / next"),
+    ("R", "auto-ramp the speed"),
+];
+
+const HELP_TIMER: &[(&str, &str)] = &[
+    ("SPACE / P", "run / pause / resume"),
+    ("C", "clear back to the start"),
+    ("U", "count down / count up"),
+    ("+ / -", "lengthen / shorten the run"),
+];
+
+/// The rows for the panel, in the order they are drawn: whatever is specific to
+/// the current mode first, then the keys that mean the same thing either way.
+fn help_rows(e: &Engine) -> Vec<(&'static str, &'static str)> {
+    let mut v = Vec::new();
+    if e.mode == Mode::Timer {
+        v.extend_from_slice(HELP_TIMER);
+        v.push(("T", "back to the words"));
+    } else {
+        v.extend_from_slice(HELP_WORDS);
+        v.push(("T", "open the timer"));
+    }
+    v.extend_from_slice(HELP_SHARED);
+    v
+}
 
 /// Panel geometry, so the box always fits the longest row on any width.
 struct Panel {
@@ -508,16 +654,16 @@ struct Panel {
     key_col: usize,
 }
 
-fn panel_for(cols: usize, rows: usize) -> Panel {
-    let key_w = HELP.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(12);
-    let val_w = HELP.iter().map(|(_, v)| v.chars().count()).max().unwrap_or(20);
+fn panel_for(rows: &[(&str, &str)], cols: usize, screen_rows: usize) -> Panel {
+    let key_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(12);
+    let val_w = rows.iter().map(|(_, v)| v.chars().count()).max().unwrap_or(20);
     // panel = 1 border + 2 pad + key + 2 gutter + val + 1 border
     let want = 3 + key_w + 2 + val_w + 1;
     let w = want.min(cols.saturating_sub(2));
-    let h = (HELP.len() + 4).min(rows.saturating_sub(2));
+    let h = (rows.len() + 4).min(screen_rows.saturating_sub(2));
     Panel {
         x: (cols.saturating_sub(w)) / 2,
-        y: (rows.saturating_sub(h)) / 2,
+        y: (screen_rows.saturating_sub(h)) / 2,
         w,
         h,
         key_col: 3,
@@ -526,7 +672,8 @@ fn panel_for(cols: usize, rows: usize) -> Panel {
 
 /// Returns the panel rect, so the frame that closes it can wipe it.
 fn help(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
-    let p = panel_for(cols, rows);
+    let items = help_rows(e);
+    let p = panel_for(&items, cols, rows);
     let a = e.hud.max(0.5);
     let edge = style::mix(BG, CYAN, a);
     let title_c = style::mix(BG, FG, a);
@@ -555,7 +702,7 @@ fn help(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     if key_room < 3 {
         return (p.x, p.y, p.w, p.h);
     }
-    for (i, (k, v)) in HELP.iter().enumerate() {
+    for (i, (k, v)) in items.iter().enumerate() {
         let ry = p.y + 3 + i;
         if ry >= p.y + p.h - 1 {
             break;

@@ -43,6 +43,21 @@ struct Args {
     words: Option<String>,
     lang: Option<String>,
     stdin: bool,
+    /// `(counting down, length in seconds)` when `--timer` was given.
+    timer: Option<(bool, f64)>,
+}
+
+/// `--timer` takes a length in seconds, or `up` / `down` for a stopwatch or the
+/// default countdown.
+fn timer_arg(v: &str) -> Result<(bool, f64), String> {
+    match v.to_ascii_lowercase().as_str() {
+        "up" => Ok((false, 0.0)),
+        "down" => Ok((true, engine::DEFAULT_TIMER)),
+        n => n
+            .parse::<f64>()
+            .map(|s| (true, s))
+            .map_err(|_| format!("--timer wants seconds, `up` or `down` (got `{v}`)")),
+    }
 }
 
 fn parse() -> Result<Args, String> {
@@ -53,8 +68,11 @@ fn parse() -> Result<Args, String> {
         words: None,
         lang: None,
         stdin: false,
+        timer: None,
     };
-    let mut it = std::env::args().skip(1);
+    // Peekable so `--timer` can take a value or stand alone, the way `ps` and
+    // friends do.
+    let mut it = std::env::args().skip(1).collect::<Vec<_>>().into_iter().peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => a.help = true,
@@ -72,6 +90,19 @@ fn parse() -> Result<Args, String> {
             }
             "-g" | "--lang" => {
                 a.lang = Some(it.next().ok_or("--lang needs a code")?);
+            }
+            "-t" | "--timer" => {
+                // A bare `--timer` is the default countdown; with a value it is
+                // either a length in seconds or the word `up` / `down`.
+                let peek = it.peek().cloned();
+                let spec = match peek.as_deref() {
+                    Some(v) if !v.starts_with('-') => {
+                        it.next();
+                        Some(timer_arg(v)?)
+                    }
+                    _ => None,
+                };
+                a.timer = Some(spec.unwrap_or((true, engine::DEFAULT_TIMER)));
             }
             v if v.starts_with('-') => return Err(format!("unknown flag {v}")),
             v => return Err(format!("unexpected argument {v}")),
@@ -93,8 +124,17 @@ fn usage() {
     -w, --words <path>  phrases from a file, or from every .txt in a directory
     -g, --lang <code>   start from a bundled language ({langs})
     -i, --stdin         also read phrases from a pipe
+    -t, --timer [spec]  start on the clock: seconds, or `up` / `down`
     -l, --list          print the built-in phrases and exit
     -h, --help          this text
+
+  TIMER
+    `T` swaps between the typewriter and the clock at any time.
+
+        words --timer          a 25:00 countdown, armed and waiting
+        words --timer 90       a minute and a half
+        words --timer up       a stopwatch, counting up from zero
+        words --timer down     the 25:00 countdown again
 
   PHRASES
     A words.txt in the working directory is used if --words is not given, and
@@ -103,7 +143,7 @@ fn usage() {
         # short        (built-in: fragments, short, thoughts)
         WAKE UP
         # thoughts
-        THE CITY NEVER REALLY SLEEPS
+        THE CITY NEVER REALLY SLEAPS
 
     Anything supplied by --stdin or --words is added to a --lang set, or used on
     its own in place of the built-in phrases. A single --words file is watched
@@ -114,7 +154,14 @@ fn usage() {
     SPACE     next phrase         ← →     previous / next
     F         font                R       auto-ramp speed
     G         force a glitch      B       pin the control bar
-    H  ?      controls            Q       quit
+    T         words / timer       H  ?    controls
+    Q         quit
+
+  KEYS (on the clock)
+    SPACE / P run · pause · resume    C   clear back to the start
+    U         count down / count up   +/- lengthen / shorten the run
+    F  font   G  glitch   B  pin      T   back to the words
+    H / ?    controls                 Q   quit
 "
     );
 }
@@ -168,6 +215,11 @@ fn main() {
     if !sources.sections.is_empty() {
         e.use_sections(&sources.sections);
     }
+    // After the phrases, so that asking for the clock at startup isn't undone
+    // by the phrase cycle settling itself into the Typing phase.
+    if let Some((down, secs)) = args.timer {
+        e.start_timer(down, secs);
+    }
     let mut watch = sources.watch.map(Watch::new);
 
     // --- input ---------------------------------------------------------------
@@ -212,6 +264,11 @@ fn main() {
         out.put("\x1b[H");
         view::chrome(&e, &mut out, c as usize, r as usize);
         view::draw(&mut e, &mut out);
+        // The bell rides along in the frame's own write, so a countdown that
+        // hits zero rings on the same frame it strobes.
+        if e.take_beep() {
+            out.put("\x07");
+        }
         if out.flush().is_err() {
             break 'run;
         }
@@ -226,6 +283,7 @@ fn main() {
 }
 
 /// Where the phrases come from, and the one file worth watching for changes.
+#[derive(Debug)]
 struct Sources {
     sections: Vec<phrases::Section>,
     watch: Option<PathBuf>,
@@ -281,7 +339,14 @@ fn resolve(args: &Args) -> Result<Sources, String> {
     }
 
     if sections.is_empty() {
-        return Err("no usable phrases".into());
+        // The clock never shows a phrase until you press T, so an empty words
+        // file is not a reason to refuse to start there: fall back to the
+        // built-ins for whenever the timer is dismissed.
+        if args.timer.is_some() {
+            sections = phrases::builtin_sections();
+        } else {
+            return Err("no usable phrases".into());
+        }
     }
     Ok(Sources { sections, watch })
 }
@@ -464,6 +529,7 @@ mod tests {
             words: words.map(String::from),
             lang: lang.map(String::from),
             stdin,
+            timer: None,
         }
     }
 
@@ -549,6 +615,65 @@ mod tests {
             s.due(None, t0 + SETTLE),
             "and recorded, so recreating it is a fresh edit"
         );
+    }
+
+    // -- the timer flag ------------------------------------------------------
+
+    #[test]
+    fn a_bare_timer_flag_is_the_default_countdown() {
+        assert_eq!(timer_arg("600").unwrap(), (true, 600.0));
+        assert_eq!(timer_arg("up").unwrap(), (false, 0.0));
+        assert_eq!(timer_arg("up").unwrap().0, false, "a stopwatch counts up");
+        assert_eq!(
+            timer_arg("down").unwrap(),
+            (true, engine::DEFAULT_TIMER),
+            "`down` means the default length"
+        );
+    }
+
+    #[test]
+    fn the_timer_words_are_case_insensitive() {
+        assert_eq!(timer_arg("UP").unwrap(), timer_arg("up").unwrap());
+        assert_eq!(timer_arg("Down").unwrap(), timer_arg("down").unwrap());
+    }
+
+    #[test]
+    fn a_nonsense_timer_length_is_refused_by_name() {
+        for bad in ["soon", "", "-5", "10 minutes", "1e400x"] {
+            let err = timer_arg(bad).unwrap_err();
+            assert!(err.contains(bad) || bad.is_empty(), "{bad}: {err}");
+        }
+    }
+
+    /// A countdown nobody can wait out is a broken timer, and one long enough to
+    /// lose count of is worse: the hours field exists so the number stays true.
+    #[test]
+    fn a_countdown_length_is_clamped_to_something_sane() {
+        for (given, want) in [(1.0, engine::MIN_TIMER), (-99.0, engine::MIN_TIMER)] {
+            let mut a = timer_arg(&given.to_string()).unwrap();
+            let mut e = engine::Engine::new(1, 80, 24);
+            e.start_timer(a.0, a.1);
+            assert_eq!(e.timer.total, want, "{given}s");
+            a.1 = want;
+        }
+        let (_, long) = timer_arg("999999").unwrap();
+        let mut e = engine::Engine::new(1, 80, 24);
+        e.start_timer(true, long);
+        assert_eq!(e.timer.total, engine::MAX_TIMER);
+    }
+
+    /// The clock only shows phrases once you dismiss it, so a words file with
+    /// nothing usable in it is not a reason to refuse to start there.
+    #[test]
+    fn an_empty_words_file_does_not_stop_the_timer_starting() {
+        let d = Scratch::new("timeronly");
+        let f = d.write("w.txt", "# short\n## nothing here\n");
+        let mut a = args(Some(f.to_str().unwrap()), None, false);
+        assert!(resolve(&a).is_err(), "the words alone have nothing to say");
+
+        a.timer = Some((true, engine::DEFAULT_TIMER));
+        let s = resolve(&a).expect("the clock does not care");
+        assert!(!flat(&s.sections).is_empty(), "so the built-ins stand in");
     }
 
     // -- sources -------------------------------------------------------------
