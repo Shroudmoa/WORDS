@@ -1,8 +1,11 @@
 //! The typewriter itself: state machine, timing model, and key handling.
 
+use std::path::PathBuf;
+
 use crate::font;
 use crate::phrases;
 use crate::style::{self, Rng};
+use crate::time::Wall;
 
 // -- tuning -----------------------------------------------------------------
 
@@ -72,11 +75,15 @@ impl Phase {
     }
 }
 
-/// What is in the middle of the screen: the typewriter, or a clock.
+/// What is in the middle of the screen: the typewriter, the clock counter, or a
+/// wall clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Words,
+    /// A countdown / stopwatch, driven by the keys.
     Timer,
+    /// The actual time of day, driven by the machine.
+    Clock,
 }
 
 /// A countdown or a stopwatch.
@@ -132,6 +139,37 @@ impl Timer {
 pub enum Action {
     None,
     Quit,
+    /// The menu picked a file for the caller to read and install.
+    OpenFile(PathBuf),
+}
+
+/// One selectable row on the menu, and what choosing it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuItem {
+    pub label: String,
+    pub kind: MenuKind,
+}
+
+impl MenuItem {
+    pub fn new(label: impl Into<String>, kind: MenuKind) -> MenuItem {
+        MenuItem {
+            label: label.into(),
+            kind,
+        }
+    }
+}
+
+/// What a menu row stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuKind {
+    /// The typewriter, with whatever phrases it already has.
+    Words,
+    /// The countdown / stopwatch.
+    Counter,
+    /// The wall clock.
+    Clock,
+    /// Load the phrases out of this file and switch to the words.
+    File(PathBuf),
 }
 
 pub struct Glyph {
@@ -207,6 +245,9 @@ pub struct Engine {
     // -- the clock ------------------------------------------------------------
     pub mode: Mode,
     pub timer: Timer,
+    /// The current wall-clock reading, handed in from outside so the engine
+    /// never has to ask the system for the time itself.
+    pub wall: Wall,
     /// The font the words were using, so `T` can hand it back untouched. A
     /// clock wants the pixel font every time; the words should not inherit
     /// that choice on the way out.
@@ -222,6 +263,12 @@ pub struct Engine {
     /// Set for one frame when the alarm wants a bell. The frame loop owns the
     /// output buffer, so the engine raises a flag rather than writing bytes.
     pub beep: bool,
+
+    // -- the menu -------------------------------------------------------------
+    /// The picker: modes plus any phrase files found under the config dir.
+    pub menu_open: bool,
+    pub menu: Vec<MenuItem>,
+    pub menu_sel: usize,
 }
 
 impl Engine {
@@ -273,11 +320,15 @@ impl Engine {
             overlay: None,
             mode: Mode::Words,
             timer: Timer::countdown(DEFAULT_TIMER),
+            wall: Wall::from_local(0),
             words_pixel: false,
             label_row: false,
             flash: 0.0,
             flash_glyph: 0,
             beep: false,
+            menu_open: false,
+            menu: Vec::new(),
+            menu_sel: 0,
         };
         e.next_glitch = e.glitch_soon(GLITCH_AMBIENT.0, GLITCH_AMBIENT.1);
         e.load(0);
@@ -522,8 +573,11 @@ impl Engine {
         }
     }
 
-    fn timer_text(&self) -> String {
-        Self::hms(self.timer.value)
+    fn digits_text(&self) -> String {
+        match self.mode {
+            Mode::Clock => self.wall.hms(),
+            _ => Self::hms(self.timer.value),
+        }
     }
 
     /// Which way the numbers are going, for the strip and the caption.
@@ -536,22 +590,27 @@ impl Engine {
     }
 
     /// The caption under the digits: `24:59` on its own doesn't say whether it
-    /// is running out or running on.
+    /// is running out or running on, and the time of day doesn't say what day
+    /// it is.
     pub fn label_text(&self) -> Option<String> {
-        if self.mode != Mode::Timer || !self.label_row {
+        if !self.label_row {
             return None;
         }
-        Some(match self.phase {
-            Phase::Done => "TIME'S UP".to_string(),
-            _ if self.timer.down => "COUNTDOWN".to_string(),
-            _ => "STOPWATCH".to_string(),
-        })
+        match self.mode {
+            Mode::Clock => Some(self.wall.date()),
+            Mode::Timer => Some(match self.phase {
+                Phase::Done => "TIME'S UP".to_string(),
+                _ if self.timer.down => "COUNTDOWN".to_string(),
+                _ => "STOPWATCH".to_string(),
+            }),
+            Mode::Words => None,
+        }
     }
 
     /// Re-lay the digits when the string on them has changed, and light the one
     /// that moved.
     fn sync_digits(&mut self) {
-        let next = self.timer_text();
+        let next = self.digits_text();
         if next == self.text {
             return;
         }
@@ -570,7 +629,7 @@ impl Engine {
 
     /// Lay the clock out as one centred row of glyphs.
     fn load_digits(&mut self) {
-        let text = self.timer_text();
+        let text = self.digits_text();
         let pixel = self.pixel;
         let max_w = self.max_text_cols().max(4);
         let avail = (self.rows as usize)
@@ -632,8 +691,10 @@ impl Engine {
 
     /// Start in timer mode, keeping whatever direction and length are set up.
     pub fn start_timer(&mut self, down: bool, secs: f64) {
+        if self.mode == Mode::Words {
+            self.words_pixel = self.pixel;
+        }
         self.mode = Mode::Timer;
-        self.words_pixel = self.pixel;
         // A clock is the one thing on this screen worth the big font.
         self.pixel = true;
         self.timer = if down {
@@ -644,6 +705,34 @@ impl Engine {
         self.phase = Phase::Ready;
         self.flash = 0.0;
         self.load_digits();
+    }
+
+    /// Start in wall-clock mode: the actual time, running because it is time.
+    ///
+    /// The reading itself is fed in with [`set_wall`], so this only has to put
+    /// the digits on screen.
+    pub fn start_clock(&mut self) {
+        if self.mode == Mode::Words {
+            self.words_pixel = self.pixel;
+        }
+        self.mode = Mode::Clock;
+        self.pixel = true;
+        // A wall clock is never armed or paused: it is always running.
+        self.phase = Phase::Running;
+        self.flash = 0.0;
+        self.load_digits();
+    }
+
+    /// Take a fresh wall-clock reading. The digits re-lay only when the second
+    /// (or the date) actually changes, so the common case is a compare.
+    pub fn set_wall(&mut self, wall: Wall) {
+        if wall == self.wall {
+            return;
+        }
+        self.wall = wall;
+        if self.mode == Mode::Clock {
+            self.sync_digits();
+        }
     }
 
     /// Back to a fresh start at the same direction and length.
@@ -768,6 +857,15 @@ impl Engine {
         self.sync_digits();
     }
 
+    /// A wall clock does not advance its own value -- the second is fed in from
+    /// outside -- so all that ticks over here is the flash on the digit that
+    /// moved.
+    fn update_clock(&mut self, dt: f64) {
+        if self.flash > 0.0 {
+            self.flash = (self.flash - dt / FLASH_TIME).max(0.0);
+        }
+    }
+
     /// The frame loop asks once per frame and writes the bell itself.
     pub fn take_beep(&mut self) -> bool {
         std::mem::take(&mut self.beep)
@@ -815,12 +913,12 @@ impl Engine {
             Phase::Boot => {
                 self.boot += dt;
                 if self.boot >= BOOT_TIME {
-                    // A clock has no first phrase to type, so it comes up
-                    // armed and waiting instead.
-                    self.phase = if self.mode == Mode::Timer {
-                        Phase::Ready
-                    } else {
-                        Phase::Typing
+                    // A clock has no first phrase to type, so the counter comes
+                    // up armed and waiting and the wall clock starts running.
+                    self.phase = match self.mode {
+                        Mode::Timer => Phase::Ready,
+                        Mode::Clock => Phase::Running,
+                        Mode::Words => Phase::Typing,
                     };
                     self.full = true;
                 }
@@ -874,10 +972,12 @@ impl Engine {
             _ => {}
         }
 
-        // The clock runs on its own phase, so it gets a look after the
+        // The clocks run on their own phases, so they get a look after the
         // typewriter's match rather than inside it.
-        if self.mode == Mode::Timer {
-            self.update_timer(dt);
+        match self.mode {
+            Mode::Timer => self.update_timer(dt),
+            Mode::Clock => self.update_clock(dt),
+            Mode::Words => {}
         }
     }
 
@@ -907,6 +1007,11 @@ impl Engine {
 
     pub fn key(&mut self, b: u8) -> Action {
         self.idle = 0.0;
+        // While the picker is up it owns the keyboard: a stray `W` should move
+        // the selection, not the typing speed behind the panel.
+        if self.menu_open {
+            return self.menu_key(b);
+        }
         match b {
             b'q' | b'Q' | 0x03 | 0x04 => return Action::Quit,
             b'?' | b'h' | b'H' => {
@@ -916,47 +1021,153 @@ impl Engine {
                 self.help = !self.help;
                 self.full = true;
             }
-            b't' | b'T' => self.toggle_mode(),
+            b'm' | b'M' => self.open_menu(),
+            b't' | b'T' => self.cycle_mode(),
             b'g' | b'G' => self.kick(),
             b'b' | b'B' => self.pin = !self.pin,
             b'f' | b'F' => self.toggle_font(),
             _ if self.mode == Mode::Timer => self.timer_key(b),
+            _ if self.mode == Mode::Clock => self.clock_key(b),
             _ => self.words_key(b),
         }
         Action::None
     }
 
-    /// Switch between the typewriter and the clock.
+    /// The name of the mode in the middle of the screen, for the strip and the
+    /// little confirmation the mode keys flash up.
+    pub fn mode_name(&self) -> &'static str {
+        match self.mode {
+            Mode::Words => "WORDS",
+            Mode::Timer => "COUNTER",
+            Mode::Clock => "CLOCK",
+        }
+    }
+
+    /// `T` walks the three modes in a ring.
+    fn cycle_mode(&mut self) {
+        let next = match self.mode {
+            Mode::Words => Mode::Timer,
+            Mode::Timer => Mode::Clock,
+            Mode::Clock => Mode::Words,
+        };
+        self.set_mode(next);
+        self.notice = Some((self.mode_name().to_string(), 2.0));
+    }
+
+    /// Switch to `mode`, handing each side back the way it was left.
     ///
-    /// Both sides are handed back the way they were left -- the words keep
-    /// their phrase, the clock keeps its direction and length -- because the
-    /// whole point of a mode toggle is that you can flick over and come back.
-    fn toggle_mode(&mut self) {
-        if self.mode == Mode::Words {
-            self.mode = Mode::Timer;
-            self.words_pixel = self.pixel;
-            self.pixel = true;
-            self.timer_reset();
-            self.load_digits();
-            self.notice = Some(("TIMER".to_string(), 2.0));
-        } else {
-            self.mode = Mode::Words;
-            self.pixel = self.words_pixel;
-            self.vis = 1.0;
-            self.vis_target = 1.0;
-            let idx = self.idx;
-            self.load(idx);
-            self.phase = Phase::Typing;
-            self.notice = Some(("WORDS".to_string(), 2.0));
+    /// The words keep their phrase and font; the counter keeps whatever it was
+    /// doing. Only a counter that has never been armed gets a fresh start, so
+    /// flicking over and back does not quietly reset a run in progress.
+    fn set_mode(&mut self, mode: Mode) {
+        if self.mode == mode {
+            return;
+        }
+        match mode {
+            Mode::Words => {
+                self.mode = Mode::Words;
+                self.pixel = self.words_pixel;
+                self.vis = 1.0;
+                self.vis_target = 1.0;
+                let idx = self.idx;
+                self.load(idx);
+                self.phase = Phase::Typing;
+            }
+            Mode::Timer => {
+                if self.mode == Mode::Words {
+                    self.words_pixel = self.pixel;
+                }
+                self.mode = Mode::Timer;
+                self.pixel = true;
+                let armed = matches!(
+                    self.phase,
+                    Phase::Ready | Phase::Running | Phase::Paused | Phase::Done
+                );
+                if !armed {
+                    self.phase = Phase::Ready;
+                    self.timer_reset();
+                }
+                self.flash = 0.0;
+                self.load_digits();
+            }
+            Mode::Clock => self.start_clock(),
         }
         self.full = true;
         self.idle = 0.0;
         self.hud_target = 1.0;
     }
 
+    // -- the menu ------------------------------------------------------------
+
+    /// Hand the picker its rows. Called at startup and whenever the config
+    /// directory is re-scanned, so a file dropped in there shows up.
+    pub fn set_menu(&mut self, items: Vec<MenuItem>) {
+        self.menu = items;
+        if self.menu_sel >= self.menu.len() {
+            self.menu_sel = self.menu.len().saturating_sub(1);
+        }
+    }
+
+    pub fn open_menu(&mut self) {
+        self.menu_open = true;
+        self.help = false;
+        self.full = true;
+        self.idle = 0.0;
+        self.hud_target = 1.0;
+    }
+
+    fn close_menu(&mut self) {
+        self.menu_open = false;
+        self.full = true;
+    }
+
+    /// Keys that only mean something while the picker is up.
+    fn menu_key(&mut self, b: u8) -> Action {
+        let n = self.menu.len();
+        match b {
+            b'q' | b'Q' | 0x03 | 0x04 => return Action::Quit,
+            b'm' | b'M' | 0x1b => self.close_menu(),
+            KEY_UP | b'k' | b'K' | b'w' | b'W' => {
+                self.menu_sel = self.menu_sel.saturating_sub(1);
+            }
+            KEY_DOWN | b'j' | b'J' | b's' | b'S' if n > 0 => {
+                self.menu_sel = (self.menu_sel + 1).min(n - 1);
+            }
+            b' ' | b'\n' | b'\r' => return self.choose_menu(),
+            b'1'..=b'9' => {
+                let i = (b - b'1') as usize;
+                if i < n {
+                    self.menu_sel = i;
+                    return self.choose_menu();
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Act on the highlighted row. The three built-in rows switch mode here;
+    /// a file has to be read by the caller, so it is handed back as an action.
+    fn choose_menu(&mut self) -> Action {
+        let Some(item) = self.menu.get(self.menu_sel).cloned() else {
+            self.close_menu();
+            return Action::None;
+        };
+        self.close_menu();
+        let mode = match &item.kind {
+            MenuKind::Words => Mode::Words,
+            MenuKind::Counter => Mode::Timer,
+            MenuKind::Clock => Mode::Clock,
+            MenuKind::File(path) => return Action::OpenFile(path.clone()),
+        };
+        self.set_mode(mode);
+        self.notice = Some((item.label, 2.0));
+        Action::None
+    }
+
     fn toggle_font(&mut self) {
         self.pixel = !self.pixel;
-        if self.mode == Mode::Timer {
+        if matches!(self.mode, Mode::Timer | Mode::Clock) {
             self.load_digits();
             return;
         }
@@ -1012,6 +1223,10 @@ impl Engine {
         self.sync_digits();
     }
 
+    /// A wall clock has nothing to run, pause or reset, so no key means anything
+    /// to it: the font, glitch and pin keys are handled before we get here.
+    fn clock_key(&mut self, _b: u8) {}
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if cols != self.cols || rows != self.rows {
             self.cols = cols;
@@ -1021,9 +1236,10 @@ impl Engine {
     }
 
     /// The bar shows while you're using it and leaves three seconds after your
-    /// last keypress. `pin`, auto-ramp and the help panel all hold it open.
+    /// last keypress. `pin`, auto-ramp, the help panel and the open menu all
+    /// hold it open.
     pub fn hide_hud(&mut self) {
-        let want = if self.pin || self.rapid || self.help || self.idle < HUD_IDLE {
+        let want = if self.pin || self.rapid || self.help || self.menu_open || self.idle < HUD_IDLE {
             1.0
         } else {
             0.0
@@ -1045,6 +1261,14 @@ impl Engine {
     pub fn use_sections(&mut self, secs: &[phrases::Section]) {
         let cycle = phrases::mix(secs, &mut self.rand);
         self.use_phrases(cycle);
+    }
+
+    /// Load a phrase file picked from the menu and show it, whichever mode the
+    /// screen happened to be in.
+    pub fn show(&mut self, secs: &[phrases::Section]) {
+        self.use_sections(secs);
+        self.set_mode(Mode::Words);
+        self.notice = Some(("LOADED".to_string(), 2.5));
     }
 
     /// Take on a new phrase set without restarting the session clock, and say so
@@ -1549,25 +1773,115 @@ mod tests {
     }
 
     #[test]
-    fn t_hands_each_mode_back_the_way_it_was_left() {
+    fn t_walks_the_three_modes_and_hands_each_back_the_way_it_was_left() {
         let mut e = eng(80, 24);
         e.pixel = false;
         let phrase = e.text.clone();
-        assert!(!e.pixel);
 
+        // The words were on the terminal font: remember that, because a clock
+        // always wants the big one and must not leave it behind on the way out.
         e.key(b't');
         assert_eq!(e.mode, Mode::Timer);
-        assert!(e.pixel, "the clock turns the big font on for itself");
+        assert!(e.pixel, "the counter turns the big font on for itself");
         e.key(b' ');
         run(&mut e, 30.0);
         let kept = e.timer.value;
+
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Clock);
+        assert!(e.pixel, "and so does the wall clock");
+        e.set_wall(Wall::from_local(0));
+        assert_eq!(e.text, "00:00:00", "the wall reading is what is on screen");
+        assert_eq!(e.label_text().as_deref(), Some("THU 1970-01-01"));
 
         e.key(b't');
         assert_eq!(e.mode, Mode::Words);
         assert!(!e.pixel, "and the words get their own font back");
         assert_eq!(e.text, phrase, "picking up the phrase it was on");
         assert_eq!(e.phase, Phase::Typing);
-        assert!(e.timer.value <= kept, "the clock kept its place");
+        assert_eq!(e.label_text(), None, "the words carry no caption");
+        assert!(e.timer.value <= kept, "the counter kept its place");
+    }
+
+    #[test]
+    fn the_wall_clock_shows_the_reading_it_is_handed() {
+        let mut e = Engine::new(1, 80, 24);
+        e.start_clock();
+        assert_eq!(e.mode, Mode::Clock);
+        assert_eq!(e.phase, Phase::Running, "a wall clock is always running");
+
+        // 1970-01-01T00:00:00Z, a Thursday.
+        e.set_wall(Wall::from_local(0));
+        assert_eq!(e.text, "00:00:00");
+        assert_eq!(e.label_text().as_deref(), Some("THU 1970-01-01"));
+
+        // A second later the digits move on their own.
+        e.set_wall(Wall::from_local(1));
+        assert_eq!(e.text, "00:00:01");
+
+        // A reading that has not changed is a no-op, flash and all.
+        e.flash = 0.0;
+        e.set_wall(Wall::from_local(1));
+        assert_eq!(e.flash, 0.0, "the same second is not a new tick");
+    }
+
+    #[test]
+    fn the_menu_switches_modes_from_a_number_key() {
+        let mut e = eng(80, 24);
+        e.set_menu(vec![
+            MenuItem::new("WORDS", MenuKind::Words),
+            MenuItem::new("COUNTER", MenuKind::Counter),
+            MenuItem::new("CLOCK", MenuKind::Clock),
+        ]);
+
+        e.key(b'm');
+        assert!(e.menu_open, "M brings the picker up");
+        assert!(!e.pixel, "and it owns the keyboard: no font flip behind it");
+        e.key(b'f');
+        assert!(!e.pixel, "F did nothing while the picker was up");
+
+        // Row three is the clock, and picking it switches and closes.
+        let action = e.key(b'3');
+        assert!(matches!(action, Action::None));
+        assert!(!e.menu_open);
+        assert_eq!(e.mode, Mode::Clock);
+    }
+
+    #[test]
+    fn the_menu_hands_a_chosen_file_back_to_the_caller() {
+        let file = PathBuf::from("/tmp/words/my list.txt");
+        let mut e = eng(80, 24);
+        e.set_menu(vec![
+            MenuItem::new("WORDS", MenuKind::Words),
+            MenuItem::new("COUNTER", MenuKind::Counter),
+            MenuItem::new("CLOCK", MenuKind::Clock),
+            MenuItem::new("MY LIST", MenuKind::File(file.clone())),
+        ]);
+
+        e.key(b'm');
+        for _ in 0..3 {
+            e.key(b'j');
+        }
+        assert_eq!(e.menu_sel, 3, "the file is the last row");
+        let action = e.key(b'\n');
+        match action {
+            Action::OpenFile(p) => assert_eq!(p, file),
+            _ => panic!("a file row should be handed back to be read"),
+        }
+        assert!(!e.menu_open, "picking anything closes the picker");
+        assert_eq!(e.mode, Mode::Words, "switching is the caller's job here");
+    }
+
+    #[test]
+    fn escaping_the_menu_leaves_the_mode_alone() {
+        let mut e = eng(80, 24);
+        e.set_menu(vec![MenuItem::new("CLOCK", MenuKind::Clock)]);
+        e.key(b'm');
+        e.key(b'j');
+        assert_eq!(e.menu_sel, 0, "nothing to move down onto");
+        e.key(0x1b);
+        assert!(!e.menu_open);
+        assert_eq!(e.mode, Mode::Words, "the picker changed nothing");
     }
 
     #[test]

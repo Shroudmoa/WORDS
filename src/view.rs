@@ -31,7 +31,11 @@ pub fn draw(e: &mut Engine, o: &mut Out) {
 
     text_layer(e, o, cols, rows);
     hud_layer(e, o, cols, rows);
-    if e.help {
+    // The picker and the help panel share the one overlay slot; only one of
+    // them can be up at a time, and the picker wins if both somehow are.
+    if e.menu_open {
+        e.overlay = Some(menu(e, o, cols, rows));
+    } else if e.help {
         e.overlay = Some(help(e, o, cols, rows));
     }
 
@@ -389,17 +393,23 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
     // phrase, a countdown is draining towards zero, and a stopwatch has no end
     // to fill towards at all -- so it says nothing and moves instead.
     let mut sweep = false;
-    let frac = if e.mode == Mode::Timer {
-        if e.timer.down && e.timer.total > 0.0 {
-            (1.0 - e.timer.value / e.timer.total).clamp(0.0, 1.0)
-        } else {
+    let frac = match e.mode {
+        Mode::Timer => {
+            if e.timer.down && e.timer.total > 0.0 {
+                (1.0 - e.timer.value / e.timer.total).clamp(0.0, 1.0)
+            } else {
+                sweep = true;
+                0.0
+            }
+        }
+        // A wall clock has no start and no finish, so it gets the moving head
+        // rather than a fill that would imply it were heading somewhere.
+        Mode::Clock => {
             sweep = true;
             0.0
         }
-    } else if e.glyphs.is_empty() {
-        0.0
-    } else {
-        e.typed as f64 / e.glyphs.len() as f64
+        Mode::Words if e.glyphs.is_empty() => 0.0,
+        Mode::Words => e.typed as f64 / e.glyphs.len() as f64,
     };
 
     let cap = style::mix(BG, DIM, a);
@@ -473,10 +483,10 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     let key = style::mix(BG, FAINT, a.max(0.3));
 
     let mut s = Strip { x: 2, cols };
-    if e.mode == Mode::Timer {
-        strip_timer(e, o, &mut s, y, cols, a, lbl, val);
-    } else {
-        strip_words(e, o, &mut s, y, cols, a, lbl, val);
+    match e.mode {
+        Mode::Timer => strip_timer(e, o, &mut s, y, cols, a, lbl, val),
+        Mode::Clock => strip_clock(e, o, &mut s, y, cols, a, lbl, val),
+        Mode::Words => strip_words(e, o, &mut s, y, cols, a, lbl, val),
     }
     if e.pin {
         s.value(o, y, "pinned", style::mix(BG, AMBER, a));
@@ -486,12 +496,12 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         s.value(o, y, msg, style::mix(BG, GREEN, a * fade));
     }
 
-    // `cycle` counts phrases, so in timer mode it has nothing to say; the
-    // direction the clock is running is the more useful thing in that spot.
-    let right = if e.mode == Mode::Timer {
-        format!("{}  {}", e.timer_label(), clock(e.elapsed))
-    } else {
-        format!("cycle {:02}  {}", e.cycle, clock(e.elapsed))
+    // `cycle` counts phrases, so on a clock it has nothing to say; the direction
+    // the counter is running, or the mode itself, is the useful thing there.
+    let right = match e.mode {
+        Mode::Timer => format!("{}  {}", e.timer_label(), clock(e.elapsed)),
+        Mode::Clock => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
+        Mode::Words => format!("cycle {:02}  {}", e.cycle, clock(e.elapsed)),
     };
     let rx = cols.saturating_sub(right.chars().count() + 2);
     if rx > s.x + 2 {
@@ -500,10 +510,14 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         let kx = s.x + 2;
         let avail = rx.saturating_sub(kx + 2);
         if avail > 16 {
-            let hints = if e.mode == Mode::Timer {
-                "space run/pause  c clear  u direction  +/- length  t words  q quit"
-            } else {
-                "w/s speed  space next  f font  r auto  g glitch  h help  q quit"
+            let hints = match e.mode {
+                Mode::Timer => {
+                    "space run/pause  c clear  u direction  +/- length  t mode  m menu  q quit"
+                }
+                Mode::Clock => "t mode  m menu  f font  g glitch  b pin  h help  q quit",
+                Mode::Words => {
+                    "w/s speed  space next  f font  r auto  g glitch  m menu  h help  q quit"
+                }
             };
             let h: String = hints.chars().take(avail).collect();
             write_text(o, cols, kx, y, h.trim_end(), key);
@@ -575,6 +589,24 @@ fn strip_timer(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn strip_clock(
+    e: &Engine,
+    o: &mut Out,
+    s: &mut Strip,
+    y: usize,
+    _cols: usize,
+    _a: f64,
+    lbl: Rgb,
+    val: Rgb,
+) {
+    // The time is the point; the date follows because a wall clock without one
+    // leaves you guessing which day the numbers belong to.
+    s.value(o, y, &e.wall.hms(), val);
+    s.label(o, y, "now", lbl);
+    s.value(o, y, &e.wall.date(), val);
+}
+
 fn clock(secs: f64) -> String {
     let s = secs as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -611,6 +643,8 @@ const HELP_SHARED: &[(&str, &str)] = &[
     ("F", "terminal font / pixel font"),
     ("G", "force a glitch"),
     ("B", "pin the control bar"),
+    ("M", "open the menu"),
+    ("T", "next mode"),
     ("H", "close this panel"),
     ("Q", "quit"),
 ];
@@ -634,12 +668,11 @@ const HELP_TIMER: &[(&str, &str)] = &[
 /// the current mode first, then the keys that mean the same thing either way.
 fn help_rows(e: &Engine) -> Vec<(&'static str, &'static str)> {
     let mut v = Vec::new();
-    if e.mode == Mode::Timer {
-        v.extend_from_slice(HELP_TIMER);
-        v.push(("T", "back to the words"));
-    } else {
-        v.extend_from_slice(HELP_WORDS);
-        v.push(("T", "open the timer"));
+    match e.mode {
+        Mode::Timer => v.extend_from_slice(HELP_TIMER),
+        Mode::Words => v.extend_from_slice(HELP_WORDS),
+        // The wall clock has no controls of its own.
+        Mode::Clock => {}
     }
     v.extend_from_slice(HELP_SHARED);
     v
@@ -728,6 +761,78 @@ fn help(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
         write_text(o, cols, p.x + p.key_col, ry, &k, keyc);
     }
     (p.x, p.y, p.w, p.h)
+}
+
+/// The picker: the three modes, then any phrase files found under the config
+/// directory. Returns the panel rect, so the frame that closes it can wipe it.
+fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+    let items = &e.menu;
+    let a = e.hud.max(0.5);
+    let title = "SELECT";
+    let hint = "up/down   enter   esc";
+    let empty = "no phrase files yet";
+
+    let label_w = items.iter().map(|it| it.label.chars().count()).max().unwrap_or(0);
+    let content = label_w.max(if items.is_empty() { empty.len() } else { 0 });
+    let w = (content + 8)
+        .max(title.len() + 6)
+        .max(hint.len() + 4)
+        .min(cols.saturating_sub(2));
+    let h = (items.len() + 6).min(rows.saturating_sub(2));
+    let x = (cols.saturating_sub(w)) / 2;
+    let y = (rows.saturating_sub(h)) / 2;
+
+    let edge = style::mix(BG, CYAN, a);
+    let title_c = style::mix(BG, FG, a);
+    let dimc = style::mix(BG, DIM, a);
+    let itemc = style::mix(BG, FG, a);
+    let selc = style::mix(BG, CYAN, a);
+    let selbg = style::mix(BG, CYAN, a * 0.22);
+
+    // Solid backdrop so the rows read over whatever is behind them.
+    for row in 0..h {
+        style::cells(o, x, y + row, w, BG);
+    }
+    box_border(o, cols, x, y, w, h, edge);
+    write_text(
+        o,
+        cols,
+        x + (w.saturating_sub(title.chars().count())) / 2,
+        y + 1,
+        title,
+        title_c,
+    );
+
+    if items.is_empty() {
+        write_text(o, cols, x + 2, y + 3, empty, dimc);
+    }
+
+    // Show as many rows as the panel holds, scrolled so the selection stays in
+    // view when the file list is longer than the window.
+    let cap = h.saturating_sub(6).max(1);
+    let first = if e.menu_sel >= cap { e.menu_sel + 1 - cap } else { 0 };
+    let room = w.saturating_sub(7);
+    for (vi, it) in items.iter().skip(first).take(cap).enumerate() {
+        let i = first + vi;
+        let ry = y + 3 + vi;
+        let sel = i == e.menu_sel;
+        if sel {
+            style::cells(o, x + 1, ry, w - 2, selbg);
+        }
+        let label: String = if it.label.chars().count() > room {
+            let mut t: String = it.label.chars().take(room.saturating_sub(1)).collect();
+            t.push('\u{2026}');
+            t
+        } else {
+            it.label.clone()
+        };
+        let num = if i < 9 { char::from(b'1' + i as u8) } else { ' ' };
+        let line = format!("{} {} {}", if sel { '>' } else { ' ' }, num, label);
+        write_text(o, cols, x + 2, ry, &line, if sel { selc } else { itemc });
+    }
+
+    write_text(o, cols, x + 2, y + h - 2, hint, dimc);
+    (x, y, w, h)
 }
 
 fn box_border(o: &mut Out, cols: usize, x: usize, y: usize, w: usize, h: usize, c: Rgb) {

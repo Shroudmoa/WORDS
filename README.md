@@ -4,6 +4,9 @@ A classy cyberpunk terminal typewriter. It writes words and sentences in a big
 pixel font in the middle of the screen, blinks a block cursor at the end, holds
 them for a beat, then moves on — with glitch bursts tearing through the text.
 
+It is also a countdown/stopwatch and a wall clock. `T` walks between the three,
+or open the picker and choose one directly.
+
 Zero dependencies. It is raw ANSI escape codes and a 5×7 bitmap font, so it
 builds in seconds and runs anywhere with a terminal.
 
@@ -21,7 +24,12 @@ POSIX-only — Linux, macOS, and the BSDs. Nothing else is needed.
 
 ```
 -s, --seed <n>      deterministic glitch seed
--w, --words <file>  load phrases from a file (one per line)
+-w, --words <path>  load phrases from a file, or every .txt in a directory
+-g, --lang <code>   start from a bundled language
+-i, --stdin         also read phrases from a pipe
+-t, --timer [spec]  start on the counter: seconds, or `up` / `down`
+-k, --clock         start on the wall clock
+-m, --menu          open the picker at startup
 -l, --list          print the built-in phrases and exit
 -h, --help          usage
 ```
@@ -30,7 +38,25 @@ POSIX-only — Linux, macOS, and the BSDs. Nothing else is needed.
 directory is picked up when you don't pass one. Blank lines are skipped and
 anything outside the font's glyph set is folded down to ASCII, so accented
 prose ("Café naïve", "Zürich", "Straße") survives as words rather than losing
-letters.
+letters. A `--lang` set is a starting point that custom sources add to rather
+than replace.
+
+Anything dropped in `$XDG_CONFIG_HOME/words` (or `~/.config/words`) — every
+`.txt` file there, by its name — shows up on the picker, so prose can be kept
+handy without naming it on the command line.
+
+## Modes
+
+| Mode | |
+|---|---|
+| `WORDS` | the typewriter |
+| `COUNTER` | a countdown or a stopwatch, driven by the keys |
+| `CLOCK` | the real time of day and the date, driven by the machine |
+
+`--timer` and `--clock` start straight into the one you asked for; without them
+the typewriter is what you get. On the `CLOCK` the date sits under the digits
+(`MON 2026-10-12`) and a moving head sweeps the control bar, because a wall
+clock has no start or finish to fill toward.
 
 ## Keys
 
@@ -44,8 +70,15 @@ letters.
 | `R` | auto-ramp the speed |
 | `G` | force a glitch |
 | `B` | pin the control bar |
+| `T` | next mode |
+| `M` | open the picker |
 | `H` / `?` | controls |
 | `Q` | quit |
+
+On the counter, `SPACE`/`P` run, pause and resume, `C` clears back to the start,
+`U` flips between counting down and counting up, and `+`/`-` lengthen and
+shorten the run. The wall clock has no controls of its own: it is always
+running.
 
 ## How it behaves
 
@@ -83,6 +116,8 @@ src/view.rs     everything that draws
 src/style.rs    palette, colour mixing, run-coalescing canvas
 src/font.rs     5x7 glyphs
 src/phrases.rs  phrase pools and transliteration
+src/time.rs     UTC offset, civil-date maths, the clock's strings
+src/config.rs   the ~/.config/words directory the picker reads
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 ```
 
@@ -92,9 +127,10 @@ src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 cargo test
 ```
 
-Twenty unit tests cover centring, wrapping, the speed model, the three-second
-rule, the phrase transliteration, and the repaint bookkeeping that keeps stale
-pixels off the screen.
+Unit tests cover centring, wrapping, the speed model, the three-second rule,
+the phrase transliteration, and the repaint bookkeeping that keeps stale pixels
+off the screen — alongside the counter, the wall clock's date arithmetic, and
+the picker's navigation and file selection.
 
 ## Notes
 

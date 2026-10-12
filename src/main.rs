@@ -4,11 +4,13 @@
 //! hold, then dissolve. Everything chrome sits at the bottom of the screen and
 //! fades away once you stop touching the keys.
 
+mod config;
 mod engine;
 mod font;
 mod phrases;
 mod style;
 mod term;
+mod time;
 mod view;
 
 use std::io::{self, IsTerminal, Read};
@@ -36,6 +38,16 @@ const SETTLE: Duration = Duration::from_millis(400);
 /// startup on a quarter of a million lines.
 const MAX_PHRASES: usize = 5000;
 
+/// How often the wall clock is re-read while running. Cheap (just the system
+/// time against a cached offset), and four times a second keeps the visible
+/// second within a quarter of a second of the real one.
+const CLOCK_POLL: Duration = Duration::from_millis(250);
+
+/// How often the UTC offset is re-read from `date +%z`. This is the one
+/// subprocess in the clock path, and it only changes at a DST boundary, so a
+/// minute is far more often than needed and still free.
+const OFFSET_REFRESH: Duration = Duration::from_secs(60);
+
 struct Args {
     help: bool,
     list: bool,
@@ -45,6 +57,10 @@ struct Args {
     stdin: bool,
     /// `(counting down, length in seconds)` when `--timer` was given.
     timer: Option<(bool, f64)>,
+    /// Start on the wall clock.
+    clock: bool,
+    /// Open the picker at startup.
+    menu: bool,
 }
 
 /// `--timer` takes a length in seconds, or `up` / `down` for a stopwatch or the
@@ -69,6 +85,8 @@ fn parse() -> Result<Args, String> {
         lang: None,
         stdin: false,
         timer: None,
+        clock: false,
+        menu: false,
     };
     // Peekable so `--timer` can take a value or stand alone, the way `ps` and
     // friends do.
@@ -104,6 +122,8 @@ fn parse() -> Result<Args, String> {
                 };
                 a.timer = Some(spec.unwrap_or((true, engine::DEFAULT_TIMER)));
             }
+            "-k" | "--clock" => a.clock = true,
+            "-m" | "--menu" => a.menu = true,
             v if v.starts_with('-') => return Err(format!("unknown flag {v}")),
             v => return Err(format!("unexpected argument {v}")),
         }
@@ -113,6 +133,9 @@ fn parse() -> Result<Args, String> {
 
 fn usage() {
     let langs = phrases::langs().collect::<Vec<_>>().join(", ");
+    let dir = config::dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/words".to_string());
     println!(
         "words {VERSION} — a classy cyberpunk terminal typewriter
 
@@ -124,13 +147,21 @@ fn usage() {
     -w, --words <path>  phrases from a file, or from every .txt in a directory
     -g, --lang <code>   start from a bundled language ({langs})
     -i, --stdin         also read phrases from a pipe
-    -t, --timer [spec]  start on the clock: seconds, or `up` / `down`
+    -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
+    -k, --clock         start on the wall clock
+    -m, --menu          open the picker at startup
     -l, --list          print the built-in phrases and exit
     -h, --help          this text
 
-  TIMER
-    `T` swaps between the typewriter and the clock at any time.
+  MODES
+    There are three things this program can be. `T` walks between them, or
+    press `M` for the picker and choose one directly:
 
+        WORDS     the typewriter
+        COUNTER   a countdown or a stopwatch
+        CLOCK     the real time of day and the date
+
+  COUNTER
         words --timer          a 25:00 countdown, armed and waiting
         words --timer 90       a minute and a half
         words --timer up       a stopwatch, counting up from zero
@@ -143,25 +174,33 @@ fn usage() {
         # short        (built-in: fragments, short, thoughts)
         WAKE UP
         # thoughts
-        THE CITY NEVER REALLY SLEAPS
+        THE CITY NEVER REALLY SLEEPS
 
     Anything supplied by --stdin or --words is added to a --lang set, or used on
     its own in place of the built-in phrases. A single --words file is watched
     for changes while you run.
+
+    Drop any number of .txt files here, then pick one off the menu:
+
+        {dir}/
 
   KEYS (while running)
     W / ↑    faster      S / ↓    slower
     SPACE     next phrase         ← →     previous / next
     F         font                R       auto-ramp speed
     G         force a glitch      B       pin the control bar
-    T         words / timer       H  ?    controls
-    Q         quit
+    T         next mode           M       open the menu
+    H  ?      controls            Q       quit
 
-  KEYS (on the clock)
+  KEYS (on the counter)
     SPACE / P run · pause · resume    C   clear back to the start
     U         count down / count up   +/- lengthen / shorten the run
-    F  font   G  glitch   B  pin      T   back to the words
-    H / ?    controls                 Q   quit
+    F  font   G  glitch   B  pin      T   next mode
+    M  menu   H / ?  controls         Q   quit
+
+  KEYS (on the clock)
+    F  font   G  glitch   B  pin      M   open the menu
+    T  next mode   H / ?  controls    Q   quit
 "
     );
 }
@@ -215,12 +254,27 @@ fn main() {
     if !sources.sections.is_empty() {
         e.use_sections(&sources.sections);
     }
-    // After the phrases, so that asking for the clock at startup isn't undone
-    // by the phrase cycle settling itself into the Typing phase.
+    // After the phrases, so that asking for a clock at startup isn't undone by
+    // the phrase cycle settling itself into the Typing phase.
     if let Some((down, secs)) = args.timer {
         e.start_timer(down, secs);
     }
+    if args.clock {
+        e.start_clock();
+    }
+    e.set_menu(menu_items());
+    if args.menu {
+        e.open_menu();
+    }
     let mut watch = sources.watch.map(Watch::new);
+
+    // The clock reads the real time, so it needs the machine's UTC offset; the
+    // first reading is taken now so a startup clock doesn't flash midnight.
+    let mut offset = time::local_offset();
+    let mut offset_at = Instant::now();
+    e.set_wall(time::Wall::from_local(time::utc_now() + offset));
+    // Make sure the directory the menu reads from exists to be dropped into.
+    let _ = config::ensure_dir();
 
     // --- input ---------------------------------------------------------------
     let (tx, rx) = mpsc::channel::<u8>();
@@ -233,12 +287,23 @@ fn main() {
 
     let mut last = Instant::now();
     let mut watched_at = Instant::now();
+    let mut clocked_at = Instant::now();
+    let mut menu_was_open = e.menu_open;
     'run: loop {
         while let Ok(key) = rx.try_recv() {
-            if let engine::Action::Quit = e.key(key) {
-                break 'run;
+            match e.key(key) {
+                engine::Action::Quit => break 'run,
+                engine::Action::OpenFile(path) => open_phrases(&mut e, &mut watch, &path),
+                engine::Action::None => {}
             }
         }
+
+        // The picker is rebuilt every time it comes up, so a file dropped into
+        // the config directory while we were running is there to choose.
+        if e.menu_open && !menu_was_open {
+            e.set_menu(menu_items());
+        }
+        menu_was_open = e.menu_open;
 
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f64().min(0.1);
@@ -248,6 +313,18 @@ fn main() {
         e.update(dt);
         let (c, r) = tty.size();
         e.resize(c, r);
+
+        // The wall clock needs a reading several times a second so the visible
+        // second lands near the real one. The offset behind it is re-read far
+        // less often -- it only moves at a DST boundary.
+        if clocked_at.elapsed() >= CLOCK_POLL {
+            clocked_at = Instant::now();
+            if offset_at.elapsed() >= OFFSET_REFRESH {
+                offset_at = Instant::now();
+                offset = time::local_offset();
+            }
+            e.set_wall(time::Wall::from_local(time::utc_now() + offset));
+        }
 
         // Stat-ing the phrase file every frame would be sixty syscalls a second
         // to answer a question measured in hundreds of milliseconds.
@@ -282,6 +359,40 @@ fn main() {
     tty.restore();
 }
 
+/// The rows of the picker: the three modes, then every phrase file under the
+/// config directory, in name order.
+fn menu_items() -> Vec<engine::MenuItem> {
+    let mut items = vec![
+        engine::MenuItem::new("WORDS", engine::MenuKind::Words),
+        engine::MenuItem::new("COUNTER", engine::MenuKind::Counter),
+        engine::MenuItem::new("CLOCK", engine::MenuKind::Clock),
+    ];
+    for path in config::phrase_files() {
+        let label = config::label(&path);
+        items.push(engine::MenuItem::new(label, engine::MenuKind::File(path)));
+    }
+    items
+}
+
+/// Load a phrase file chosen from the menu, put it on screen, and start
+/// watching it so later edits show up live -- the same treatment `--words`
+/// gets.
+fn open_phrases(
+    e: &mut engine::Engine,
+    watch: &mut Option<Watch>,
+    path: &Path,
+) {
+    match read_file(path) {
+        Ok(secs) if !secs.is_empty() => {
+            e.show(&secs);
+            *watch = Some(Watch::new(path.to_path_buf()));
+        }
+        // A sentence the file could not be read as, or one with nothing
+        // usable in it, is worth saying rather than silently doing nothing.
+        _ => e.notice = Some(("COULD NOT READ".to_string(), 2.5)),
+    }
+}
+
 /// Where the phrases come from, and the one file worth watching for changes.
 #[derive(Debug)]
 struct Sources {
@@ -305,17 +416,18 @@ fn resolve(args: &Args) -> Result<Sources, String> {
     });
 
     let custom = want_stdin || words.is_some();
-    let mut sections = if custom {
-        match &args.lang {
-            None => Vec::new(),
-            Some(code) => {
-                let text = phrases::lang(code)
-                    .ok_or_else(|| format!("no built-in phrases for language `{code}`"))?;
-                phrases::parse(text)
-            }
+    let mut sections = match &args.lang {
+        // A `--lang` set is a deliberate starting point; anything custom is
+        // added to it rather than replacing it.
+        Some(code) => {
+            let text = phrases::lang(code)
+                .ok_or_else(|| format!("no built-in phrases for language `{code}`"))?;
+            phrases::parse(text)
         }
-    } else {
-        phrases::builtin_sections()
+        // No language and nothing custom: the built-in pools.
+        None if !custom => phrases::builtin_sections(),
+        // Custom only: start empty and let the sources fill it.
+        None => Vec::new(),
     };
 
     if want_stdin {
@@ -339,10 +451,10 @@ fn resolve(args: &Args) -> Result<Sources, String> {
     }
 
     if sections.is_empty() {
-        // The clock never shows a phrase until you press T, so an empty words
-        // file is not a reason to refuse to start there: fall back to the
-        // built-ins for whenever the timer is dismissed.
-        if args.timer.is_some() {
+        // A clock never shows a phrase until you switch to the words, so an
+        // empty words file is not a reason to refuse to start on one: fall back
+        // to the built-ins for whenever the words are asked for.
+        if args.timer.is_some() || args.clock {
             sections = phrases::builtin_sections();
         } else {
             return Err("no usable phrases".into());
@@ -392,7 +504,11 @@ fn stamp(path: &Path) -> Option<SystemTime> {
 struct Settle {
     /// The stamp we last acted on.
     seen: Option<SystemTime>,
-    /// When the stamp first looked different.
+    /// The stamp whose change we are currently waiting to settle. A second
+    /// write during the wait replaces it, restarting the clock -- otherwise a
+    /// save made of several writes could be read half-way through.
+    pending: Option<SystemTime>,
+    /// When `pending` first looked different.
     changed_at: Option<Instant>,
 }
 
@@ -400,6 +516,7 @@ impl Settle {
     fn new(seen: Option<SystemTime>) -> Settle {
         Settle {
             seen,
+            pending: None,
             changed_at: None,
         }
     }
@@ -408,16 +525,21 @@ impl Settle {
     /// the change when it fires, so it fires once per edit.
     fn due(&mut self, stamp: Option<SystemTime>, now: Instant) -> bool {
         if stamp == self.seen {
+            self.pending = None;
             self.changed_at = None;
             return false;
         }
+        // A stamp other than the one being waited on is a fresh write, so the
+        // settle window starts again from here.
+        if self.pending != stamp || self.changed_at.is_none() {
+            self.pending = stamp;
+            self.changed_at = Some(now);
+            return false;
+        }
         match self.changed_at {
-            None => {
-                self.changed_at = Some(now);
-                false
-            }
             Some(at) if now.saturating_duration_since(at) < SETTLE => false,
-            Some(_) => {
+            _ => {
+                self.pending = None;
                 self.changed_at = None;
                 self.seen = stamp;
                 true
@@ -530,6 +652,8 @@ mod tests {
             lang: lang.map(String::from),
             stdin,
             timer: None,
+            clock: false,
+            menu: false,
         }
     }
 
@@ -639,7 +763,7 @@ mod tests {
 
     #[test]
     fn a_nonsense_timer_length_is_refused_by_name() {
-        for bad in ["soon", "", "-5", "10 minutes", "1e400x"] {
+        for bad in ["soon", "", "-5s", "10 minutes", "1e400x"] {
             let err = timer_arg(bad).unwrap_err();
             assert!(err.contains(bad) || bad.is_empty(), "{bad}: {err}");
         }
@@ -758,9 +882,20 @@ mod tests {
         );
 
         std::fs::write(&f, "# short\nGOOD\nAND ONE MORE").unwrap();
-        // Give the watcher a settle window to notice the second save.
-        std::thread::sleep(SETTLE + WATCH_POLL * 3);
-        let secs = w.poll().expect("the fixed file loads");
+        // A watcher only fires once it has seen the same stamp stay put for a
+        // whole settle window, so a single poll can never both discover a new
+        // stamp and trust it. Poll the way the frame loop does and wait for it
+        // to land.
+        let deadline = std::time::Instant::now() + SETTLE + WATCH_POLL * 10;
+        let mut found = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(secs) = w.poll() {
+                found = Some(secs);
+                break;
+            }
+            std::thread::sleep(WATCH_POLL / 2);
+        }
+        let secs = found.expect("the fixed file loads");
         assert_eq!(flat(&secs), ["GOOD", "AND ONE MORE"]);
         assert_ne!(before, "");
     }
