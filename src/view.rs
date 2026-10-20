@@ -1,6 +1,6 @@
 //! Drawing. One frame = one string of escape codes, flushed in a single write.
 
-use crate::engine::{Engine, Glyph, Mode, Phase};
+use crate::engine::{Engine, Glyph, MenuKind, Mode, Phase};
 use crate::style::{self, Rgb};
 use crate::term::Out;
 use crate::style::{AMBER, BG, CYAN, DIM, FAINT, FG, GREEN, GLITCH_COLORS, MAGENTA};
@@ -21,26 +21,58 @@ pub fn draw(e: &mut Engine, o: &mut Out) {
         return;
     }
 
-    // The boot bar and the help panel are painted outside the footprints the
-    // text layer and the control bar track, so whichever of them is gone has
-    // to be wiped by hand -- otherwise its pixels sit under the words until
-    // something else happens to cover them.
-    if let Some((x, y, w, h)) = e.overlay.take() {
-        erase_box(o, x, y, w, h);
+    // A panel that is staying up is opaque and repaints its own rect, so the
+    // wipe is only for the frame a panel goes away. Wiping a panel that is
+    // about to be redrawn is what let a terminal catch the gap between the two
+    // and blink the whole thing off, sixty times a second.
+    let keep_out = overlay_rect(e, cols, rows);
+    if keep_out.is_none() {
+        if let Some((x, y, w, h)) = e.overlay.take() {
+            erase_box(o, x, y, w, h);
+        }
     }
 
-    text_layer(e, o, cols, rows);
-    hud_layer(e, o, cols, rows);
-    // The picker and the help panel share the one overlay slot; only one of
-    // them can be up at a time, and the picker wins if both somehow are.
-    if e.menu_open {
+    text_layer(e, o, cols, rows, keep_out);
+    hud_layer(e, o, cols, rows, keep_out);
+    // The picker, the form and the help panel share the one overlay slot;
+    // only one of them can be up at a time. The form wins over the picker
+    // (it is opened from it), and the picker over the help panel.
+    if e.form.is_some() {
+        e.overlay = Some(form(e, o, cols, rows));
+    } else if e.menu_open {
         e.overlay = Some(menu(e, o, cols, rows));
     } else if e.help {
         e.overlay = Some(help(e, o, cols, rows));
+    } else {
+        e.overlay = None;
     }
 
     o.put("\x1b[0m");
     e.full = false;
+}
+
+/// The rect the coming overlay will occupy, or `None` when nothing is up. The
+/// three panels do not know their own geometry until they paint, so the bounds
+/// are worked out here the same way they are: centred, with a fixed or
+/// list-sized box. A rect a row or two wide is harmless -- it only keeps the
+/// layers clear of the panel.
+fn overlay_rect(e: &Engine, cols: usize, rows: usize) -> Option<(usize, usize, usize, usize)> {
+    if !e.overlay_up() {
+        return None;
+    }
+    // Generous on purpose: an under-estimate would let a tear or the strip
+    // paint across the panel, while an over-estimate only leaves a little of
+    // the words frozen for as long as the panel is up.
+    let w = cols.saturating_sub(2);
+    let h = rows.saturating_sub(2);
+    let x = (cols.saturating_sub(w)) / 2;
+    let y = (rows.saturating_sub(h)) / 2;
+    Some((x, y, w, h))
+}
+
+/// Whether a row falls inside the rect an overlay is about to paint.
+fn masked(r: Option<(usize, usize, usize, usize)>, y: usize) -> bool {
+    matches!(r, Some((_, oy, _, oh)) if y >= oy && y < oy + oh)
 }
 
 // -- window bezel -----------------------------------------------------------
@@ -81,19 +113,28 @@ pub fn chrome(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
 /// Without it, a burst would leave fragments stranded on screen forever.
 const BLEED: usize = 8;
 
-fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
+fn text_layer(
+    e: &mut Engine,
+    o: &mut Out,
+    cols: usize,
+    rows: usize,
+    keep_out: Option<(usize, usize, usize, usize)>,
+) {
     let (x0, y0) = e.origin();
     let bw = e.block_width();
     let bh = e.block_size().1;
     let gh = e.glyph_size();
     let row_h = e.line_h();
-    let turbulent = e.glitch > 0.0;
+    // A panel in front of the words freezes them: no tears, no static, no
+    // ghosting. The typewriter keeps its place underneath and picks up where it
+    // was the moment the panel goes -- but nothing moves while it is being read.
+    let turbulent = e.glitch > 0.0 && keep_out.is_none();
     let caption = e.label_text();
 
     // The alarm owns the colour of the whole clock -- a five-hertz amber and
     // magenta strobe. It also has to force a repaint, because a terminal holds
     // whatever colour it was last handed and would just keep the first one.
-    let alarming = e.mode == Mode::Timer && e.timer.alarming();
+    let alarming = e.alarming();
     if alarming {
         e.full = true;
     }
@@ -151,53 +192,61 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
     let lit = e.flash_glyph;
     let fading = e.flash > 0.0;
 
-    for i in 0..visible {
-        if i < e.painted_upto && !(fading && i == lit) {
-            continue;
-        }
-        let (col, row) = {
-            let g = &e.glyphs[i];
-            (g.col, g.row)
-        };
-        let (dx, dy, ghost) = {
-            let r = &mut e.rand;
-            if turbulent && r.chance(0.22) {
-                (
-                    r.below(5) as isize - 2,
-                    r.below(3) as isize - 1,
-                    r.chance(0.45),
-                )
-            } else {
-                (0, 0, false)
+    // Under a panel the text is left exactly as it was: not repainted, not
+    // torn, not glitched. The panel covers the middle of the screen where the
+    // block sits, so what a viewer loses is pixels they could not see anyway --
+    // and what they gain is a panel that holds still.
+    if keep_out.is_none() {
+        for i in 0..visible {
+            if i < e.painted_upto && !(fading && i == lit) {
+                continue;
             }
-        };
-        let x = shift(x0 as isize + col as isize + tears[row] + dx);
-        let y = shift(y0 as isize + (row * row_h) as isize + dy);
+            let (col, row) = {
+                let g = &e.glyphs[i];
+                (g.col, g.row)
+            };
+            let (dx, dy, ghost) = {
+                let r = &mut e.rand;
+                if turbulent && r.chance(0.22) {
+                    (
+                        r.below(5) as isize - 2,
+                        r.below(3) as isize - 1,
+                        r.chance(0.45),
+                    )
+                } else {
+                    (0, 0, false)
+                }
+            };
+            let x = shift(x0 as isize + col as isize + tears[row] + dx);
+            let y = shift(y0 as isize + (row * row_h) as isize + dy);
 
-        let color = if turbulent && e.rand.chance(0.25) {
-            GLITCH_COLORS[e.rand.below(GLITCH_COLORS.len())]
-        } else if fading && i == lit {
-            style::mix(base, CYAN, e.flash)
-        } else {
-            base
-        };
+            let color = if turbulent && e.rand.chance(0.25) {
+                GLITCH_COLORS[e.rand.below(GLITCH_COLORS.len())]
+            } else if fading && i == lit {
+                style::mix(base, CYAN, e.flash)
+            } else {
+                base
+            };
 
-        if ghost {
-            // Chromatic split: a magenta ghost a couple of cells away.
-            let gi = e.rand.below(GLITCH_COLORS.len());
-            let (gx, gy) = (shift(x as isize + 2), shift(y as isize - 1));
-            paint(&e.glyphs[i], o, cols, gx, gy, GLITCH_COLORS[gi]);
+            if ghost {
+                // Chromatic split: a magenta ghost a couple of cells away.
+                let gi = e.rand.below(GLITCH_COLORS.len());
+                let (gx, gy) = (shift(x as isize + 2), shift(y as isize - 1));
+                paint(&e.glyphs[i], o, cols, gx, gy, GLITCH_COLORS[gi]);
+            }
+            paint(&e.glyphs[i], o, cols, x, y, color);
+            e.glyphs[i].at = Some((x, y));
+            e.painted_upto = e.painted_upto.max(i + 1);
         }
-        paint(&e.glyphs[i], o, cols, x, y, color);
-        e.glyphs[i].at = Some((x, y));
-        e.painted_upto = e.painted_upto.max(i + 1);
+    } else {
+        e.full = true;
     }
 
     // The caption, inside the block's footprint so the wipe above takes it too.
     if let Some(t) = &caption {
         let lx = x0 + bw.saturating_sub(t.chars().count()) / 2;
         let ly = y0 + gh;
-        if ly < rows {
+        if ly < rows && !masked(keep_out, ly) {
             write_text(o, cols, lx, ly, t, style::mix(BG, CYAN, ease(e.vis)));
         }
     }
@@ -208,8 +257,9 @@ fn text_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
         noise(e, o, x0, y0, bw, bh);
     }
 
-    // A cursor after the last digit of a clock would only read as a typo.
-    if e.mode == Mode::Words {
+    // A cursor after the last digit of a clock would only read as a typo, and a
+    // cursor blinking through a panel is worse.
+    if e.mode == Mode::Words && keep_out.is_none() {
         cursor(e, o, x0, y0, row_h, cols, rows);
     }
 }
@@ -369,11 +419,20 @@ fn erase_hud(o: &mut Out, cols: usize, bar_row: usize, rows: usize) {
 
 /// Bar and strip, together, because they share a footprint and a lifetime: the
 /// three-second idle fade has to take both down and leave nothing behind.
-fn hud_layer(e: &mut Engine, o: &mut Out, cols: usize, rows: usize) {
+fn hud_layer(
+    e: &mut Engine,
+    o: &mut Out,
+    cols: usize,
+    rows: usize,
+    keep_out: Option<(usize, usize, usize, usize)>,
+) {
     if let Some((y, r)) = e.hud_block.take() {
         erase_hud(o, cols, y, r.min(rows));
     }
-    if e.hud < 0.04 || e.chrome_rows() < 3 {
+    // A panel holds the strip still too: it is another thing that would be
+    // repainted under the panel and then painted over, and the clock in it only
+    // moves once a second anyway.
+    if keep_out.is_some() || e.hud < 0.04 || e.chrome_rows() < 3 {
         return;
     }
     let y = bar(e, o, cols, rows);
@@ -402,9 +461,10 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
                 0.0
             }
         }
-        // A wall clock has no start and no finish, so it gets the moving head
-        // rather than a fill that would imply it were heading somewhere.
-        Mode::Clock => {
+        // A wall clock has no start and no finish, and a deadline has a
+        // finish but no start anyone chose -- so both get the moving head
+        // rather than a fill that would imply they were heading somewhere.
+        Mode::Clock | Mode::Deadline => {
             sweep = true;
             0.0
         }
@@ -486,6 +546,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     match e.mode {
         Mode::Timer => strip_timer(e, o, &mut s, y, cols, a, lbl, val),
         Mode::Clock => strip_clock(e, o, &mut s, y, cols, a, lbl, val),
+        Mode::Deadline => strip_deadline(e, o, &mut s, y, cols, a, lbl, val),
         Mode::Words => strip_words(e, o, &mut s, y, cols, a, lbl, val),
     }
     if e.pin {
@@ -500,6 +561,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     // the counter is running, or the mode itself, is the useful thing there.
     let right = match e.mode {
         Mode::Timer => format!("{}  {}", e.timer_label(), clock(e.elapsed)),
+        Mode::Deadline => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
         Mode::Clock => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
         Mode::Words => format!("cycle {:02}  {}", e.cycle, clock(e.elapsed)),
     };
@@ -514,7 +576,9 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
                 Mode::Timer => {
                     "space run/pause  c clear  u direction  +/- length  t mode  m menu  q quit"
                 }
-                Mode::Clock => "t mode  m menu  f font  g glitch  b pin  h help  q quit",
+                Mode::Clock | Mode::Deadline => {
+                    "t mode  m menu  f font  g glitch  b pin  h help  q quit"
+                }
                 Mode::Words => {
                     "w/s speed  space next  f font  r auto  g glitch  m menu  h help  q quit"
                 }
@@ -601,10 +665,45 @@ fn strip_clock(
     val: Rgb,
 ) {
     // The time is the point; the date follows because a wall clock without one
-    // leaves you guessing which day the numbers belong to.
+    // leaves you guessing which day the numbers belong to. The year gets the
+    // same treatment twice over, because it is the deadline everyone has: how
+    // much of it has gone, and how long the rest is.
     s.value(o, y, &e.wall.hms(), val);
     s.label(o, y, "now", lbl);
     s.value(o, y, &e.wall.date(), val);
+    // The year is the deadline everyone has, so it gets the countdown the
+    // rest of the strip gives a deadline by name. (The share of the year
+    // gone is already under the digits, on the caption row.)
+    let (_pct, left) = crate::time::year_stats(e.local);
+    s.value(o, y, &Engine::countdown(left as f64), val);
+    s.label(o, y, "to new year", lbl);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strip_deadline(
+    e: &Engine,
+    o: &mut Out,
+    s: &mut Strip,
+    y: usize,
+    _cols: usize,
+    a: f64,
+    lbl: Rgb,
+    val: Rgb,
+) {
+    let state_c = match e.phase {
+        Phase::Running => style::mix(BG, GREEN, a),
+        Phase::Done => style::mix(BG, MAGENTA, a),
+        _ => lbl,
+    };
+    // The seconds are the point; the name and the moment follow, because a
+    // number alone does not say what it is that is nearly upon you.
+    s.value(o, y, &Engine::countdown(e.left), val);
+    s.label(o, y, "left", lbl);
+    if let Some(t) = &e.target {
+        s.value(o, y, &t.name, val);
+        s.label(o, y, &t.stamp(), lbl);
+    }
+    s.value(o, y, e.phase.label(), state_c);
 }
 
 fn clock(secs: f64) -> String {
@@ -671,8 +770,9 @@ fn help_rows(e: &Engine) -> Vec<(&'static str, &'static str)> {
     match e.mode {
         Mode::Timer => v.extend_from_slice(HELP_TIMER),
         Mode::Words => v.extend_from_slice(HELP_WORDS),
-        // The wall clock has no controls of its own.
-        Mode::Clock => {}
+        // The wall clock and a deadline have no controls of their own: they
+        // run because time does.
+        Mode::Clock | Mode::Deadline => {}
     }
     v.extend_from_slice(HELP_SHARED);
     v
@@ -763,16 +863,21 @@ fn help(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     (p.x, p.y, p.w, p.h)
 }
 
-/// The picker: the three modes, then any phrase files found under the config
-/// directory. Returns the panel rect, so the frame that closes it can wipe it.
+/// The picker: the modes, the deadlines, and any phrase files found under
+/// the config directory, in titled sections. Returns the panel rect, so the
+/// frame that closes it can wipe it.
 fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
     let items = &e.menu;
     let a = e.hud.max(0.5);
     let title = "SELECT";
-    let hint = "up/down   enter   esc";
-    let empty = "no phrase files yet";
+    let hint = "up/down move   enter open   x delete   esc close";
+    let empty = "nothing here yet";
 
-    let label_w = items.iter().map(|it| it.label.chars().count()).max().unwrap_or(0);
+    let label_w = items
+        .iter()
+        .map(|it| it.label.chars().count() + if it.kind == MenuKind::Head { 6 } else { 0 })
+        .max()
+        .unwrap_or(0);
     let content = label_w.max(if items.is_empty() { empty.len() } else { 0 });
     let w = (content + 8)
         .max(title.len() + 6)
@@ -808,13 +913,28 @@ fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     }
 
     // Show as many rows as the panel holds, scrolled so the selection stays in
-    // view when the file list is longer than the window.
+    // view when the list is longer than the window.
     let cap = h.saturating_sub(6).max(1);
     let first = if e.menu_sel >= cap { e.menu_sel + 1 - cap } else { 0 };
     let room = w.saturating_sub(7);
+    // Number keys open rows directly, so they count what can actually be
+    // opened -- a section heading does not take a number.
+    let mut numbered = 0;
+    for i in 0..first {
+        if items[i].kind != MenuKind::Head {
+            numbered += 1;
+        }
+    }
     for (vi, it) in items.iter().skip(first).take(cap).enumerate() {
         let i = first + vi;
         let ry = y + 3 + vi;
+
+        if it.kind == MenuKind::Head {
+            let line = format!("── {} ──", it.label);
+            write_text(o, cols, x + 2, ry, &line, dimc);
+            continue;
+        }
+
         let sel = i == e.menu_sel;
         if sel {
             style::cells(o, x + 1, ry, w - 2, selbg);
@@ -826,12 +946,100 @@ fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
         } else {
             it.label.clone()
         };
-        let num = if i < 9 { char::from(b'1' + i as u8) } else { ' ' };
+        let num = if numbered < 9 {
+            char::from(b'1' + numbered as u8)
+        } else {
+            ' '
+        };
         let line = format!("{} {} {}", if sel { '>' } else { ' ' }, num, label);
         write_text(o, cols, x + 2, ry, &line, if sel { selc } else { itemc });
+        numbered += 1;
     }
 
     write_text(o, cols, x + 2, y + h - 2, hint, dimc);
+    (x, y, w, h)
+}
+
+// -- the add-a-deadline form ------------------------------------------------
+
+/// The form: a name, a date and a time, one of them being filled in. Returns
+/// the panel rect, so the frame that closes it can wipe it.
+fn form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+    let Some(f) = &e.form else {
+        return (0, 0, 0, 0);
+    };
+    let a = e.hud.max(0.5);
+    let title = "NEW DEADLINE";
+    let hint = "type to fill   tab / left right field   enter save   esc cancel";
+
+    let w = (hint.len() + 6).max(title.len() + 6).min(cols.saturating_sub(2));
+    let h = 9.min(rows.saturating_sub(2));
+    let x = (cols.saturating_sub(w)) / 2;
+    let y = (rows.saturating_sub(h)) / 2;
+
+    let edge = style::mix(BG, CYAN, a);
+    let title_c = style::mix(BG, FG, a);
+    let dimc = style::mix(BG, DIM, a);
+    let valc = style::mix(BG, FG, a);
+    let selc = style::mix(BG, CYAN, a);
+    let errc = style::mix(BG, MAGENTA, a);
+
+    for row in 0..h {
+        style::cells(o, x, y + row, w, BG);
+    }
+    box_border(o, cols, x, y, w, h, edge);
+    write_text(
+        o,
+        cols,
+        x + (w.saturating_sub(title.chars().count())) / 2,
+        y + 1,
+        title,
+        title_c,
+    );
+
+    // A caret that blinks at a speed a person can follow, rather than the
+    // screen's own sixty-a-second.
+    let caret = (e.elapsed * 2.0).fract() < 0.55;
+    let fields: [(&str, &String); 3] = [
+        ("NAME", &f.name),
+        ("DATE", &f.date),
+        ("TIME", &f.time),
+    ];
+    for (i, (label, buf)) in fields.iter().enumerate() {
+        let ry = y + 2 + i;
+        let on = i == f.field;
+        write_text(o, cols, x + 3, ry, label, if on { selc } else { dimc });
+        // The box has room for the widest stamp with a little air; a longer
+        // name shows its tail, which is what is being edited anyway.
+        let bx = x + 10;
+        let room = w.saturating_sub(bx - x + 3);
+        let shown: String = if buf.chars().count() > room {
+            let mut v: Vec<char> = buf.chars().collect();
+            v.split_off(v.len() - room).into_iter().collect()
+        } else {
+            buf.to_string()
+        };
+        write_text(o, cols, bx, ry, "[", if on { selc } else { dimc });
+        write_text(o, cols, bx + 1, ry, &shown, valc);
+        write_text(
+            o,
+            cols,
+            bx + 1 + shown.chars().count(),
+            ry,
+            "]",
+            if on { selc } else { dimc },
+        );
+        if on && caret {
+            write_text(o, cols, bx + 1 + shown.chars().count(), ry, "▌", selc);
+        }
+    }
+
+    // The refusal, once there is one, takes the hint's row: what went wrong
+    // matters more than how the form works for as long as it is on screen.
+    match &f.err {
+        Some(msg) => write_text(o, cols, x + 2, y + h - 2, msg, errc),
+        None => write_text(o, cols, x + 2, y + h - 2, hint, dimc),
+    }
     (x, y, w, h)
 }
 

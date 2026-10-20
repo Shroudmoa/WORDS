@@ -4,13 +4,21 @@ A classy cyberpunk terminal typewriter. It writes words and sentences in a big
 pixel font in the middle of the screen, blinks a block cursor at the end, holds
 them for a beat, then moves on — with glitch bursts tearing through the text.
 
-It is also a countdown/stopwatch and a wall clock. `T` walks between the three,
-or open the picker and choose one directly.
+It is also a countdown/stopwatch, a wall clock, and a deadline tracker. `T`
+walks between the modes, or open the picker and choose one directly.
 
 Zero dependencies. It is raw ANSI escape codes and a 5×7 bitmap font, so it
 builds in seconds and runs anywhere with a terminal.
 
-## Build and run
+## Install
+
+```sh
+cargo install --path .
+```
+
+That builds the release binary and drops a `words` on your `PATH` (in
+`~/.cargo/bin` by default), so it runs from any directory. To build without
+installing it:
 
 ```sh
 cargo build --release
@@ -43,7 +51,9 @@ than replace.
 
 Anything dropped in `$XDG_CONFIG_HOME/words` (or `~/.config/words`) — every
 `.txt` file there, by its name — shows up on the picker, so prose can be kept
-handy without naming it on the command line.
+handy without naming it on the command line. Saved deadlines share the
+directory in a file called `deadlines`; not being a `.txt`, it stays off the
+phrase list.
 
 ## Modes
 
@@ -52,11 +62,41 @@ handy without naming it on the command line.
 | `WORDS` | the typewriter |
 | `COUNTER` | a countdown or a stopwatch, driven by the keys |
 | `CLOCK` | the real time of day and the date, driven by the machine |
+| `DEADLINE` | a countdown to a moment you named, or to the end of the year |
 
 `--timer` and `--clock` start straight into the one you asked for; without them
 the typewriter is what you get. On the `CLOCK` the date sits under the digits
 (`MON 2026-10-12`) and a moving head sweeps the control bar, because a wall
 clock has no start or finish to fill toward.
+
+## Deadlines
+
+The picker (`M`) has a `DEADLINES` section. `END OF YEAR` is always there — it
+counts down to the turn of the year and shows how much of it has gone
+(`END OF YEAR · 48.2% GONE · 137d 11:22`) — and below it are the deadlines
+you've saved, soonest first, each with its own countdown. Choosing a row makes
+it the `DEADLINE` mode and starts counting.
+
+`+ ADD A DEADLINE` opens a small form: a name, a date, and a time. `TAB` (or
+`←`/`→`) moves between the fields, the date and time take only digits, `-` and
+`:`, `BACKSPACE` deletes, `ENTER` saves and starts the countdown, and `ESC`
+cancels. A date that doesn't parse keeps the form up and says so rather than
+saving nonsense; an empty time means midnight, and an empty name becomes
+`DEADLINE`.
+
+Saved deadlines live in `~/.config/words/deadlines` (see below) as one
+`NAME | YYYY-MM-DD HH:MM` per line, in local time — plain text, hand-editable,
+and any line that doesn't parse is skipped rather than refusing the rest.
+
+The `DEADLINE` mode shows `DD:HH:MM:SS` while there is more than a day to go
+and `HH:MM:SS` inside the last day. Reaching zero rings and strobes the same
+way a countdown does, and the strip under the digits names what it is counting
+to. On the `CLOCK` the caption carries the year too (`THU 2026-10-20 · 80.0%
+GONE`), so the two answers about the year are always a glance away.
+
+To remove a deadline, highlight it in the picker and press `X`. It is taken off
+the list and the file is written back. (`X` on any other row does nothing — it
+will not delete a phrase file.)
 
 ## Keys
 
@@ -79,6 +119,12 @@ On the counter, `SPACE`/`P` run, pause and resume, `C` clears back to the start,
 `U` flips between counting down and counting up, and `+`/`-` lengthen and
 shorten the run. The wall clock has no controls of its own: it is always
 running.
+
+In the picker, `↑`/`↓` (or `W`/`S`, `K`/`J`) move, `ENTER` chooses, a digit
+jumps straight to that row, `X` deletes the highlighted deadline, and `M` or
+`ESC` closes it. Section headings (`MODES`, `DEADLINES`, `PHRASES`) are labels,
+not rows — navigation steps over them and the digit shortcuts count only the
+rows you can act on.
 
 ## How it behaves
 
@@ -116,6 +162,7 @@ src/view.rs     everything that draws
 src/style.rs    palette, colour mixing, run-coalescing canvas
 src/font.rs     5x7 glyphs
 src/phrases.rs  phrase pools and transliteration
+src/deadline.rs saved deadlines and the on-disk format
 src/time.rs     UTC offset, civil-date maths, the clock's strings
 src/config.rs   the ~/.config/words directory the picker reads
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
@@ -129,8 +176,9 @@ cargo test
 
 Unit tests cover centring, wrapping, the speed model, the three-second rule,
 the phrase transliteration, and the repaint bookkeeping that keeps stale pixels
-off the screen — alongside the counter, the wall clock's date arithmetic, and
-the picker's navigation and file selection.
+off the screen — alongside the counter, the wall clock's date arithmetic, the
+deadline file's round-trip, the year maths, and the picker's navigation and
+file selection.
 
 ## Notes
 

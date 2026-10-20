@@ -2,10 +2,11 @@
 
 use std::path::PathBuf;
 
+use crate::deadline::Deadline;
 use crate::font;
 use crate::phrases;
 use crate::style::{self, Rng};
-use crate::time::Wall;
+use crate::time::{self, Wall};
 
 // -- tuning -----------------------------------------------------------------
 
@@ -75,8 +76,8 @@ impl Phase {
     }
 }
 
-/// What is in the middle of the screen: the typewriter, the clock counter, or a
-/// wall clock.
+/// What is in the middle of the screen: the typewriter, the clock counter, a
+/// wall clock, or a countdown to a saved moment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Words,
@@ -84,6 +85,8 @@ pub enum Mode {
     Timer,
     /// The actual time of day, driven by the machine.
     Clock,
+    /// How long is left until a saved deadline, driven by the machine.
+    Deadline,
 }
 
 /// A countdown or a stopwatch.
@@ -101,10 +104,6 @@ pub struct Timer {
     /// What a countdown started from -- the denominator of the draining bar.
     /// Meaningless for a stopwatch, which has no finish line.
     pub total: f64,
-    /// Seconds of alarm left after a countdown hits zero.
-    pub alarm: f64,
-    /// Counts down to the next beep.
-    pub beep_in: f64,
 }
 
 impl Timer {
@@ -114,8 +113,6 @@ impl Timer {
             down: true,
             value: total,
             total,
-            alarm: 0.0,
-            beep_in: 0.0,
         }
     }
 
@@ -124,15 +121,7 @@ impl Timer {
             down: false,
             value: 0.0,
             total: 0.0,
-            alarm: 0.0,
-            beep_in: 0.0,
         }
-    }
-
-    /// The alarm is what a zero means while it lasts; after that the clock is
-    /// just sitting on zero, still `Done`, still waiting for a reset.
-    pub fn alarming(&self) -> bool {
-        self.alarm > 0.0
     }
 }
 
@@ -141,6 +130,12 @@ pub enum Action {
     Quit,
     /// The menu picked a file for the caller to read and install.
     OpenFile(PathBuf),
+    /// The menu's delete key on a saved deadline: the caller drops the one
+    /// with this index out of its list and writes the file back.
+    Forget(usize),
+    /// The form finished a new deadline. The caller saves it and puts it on
+    /// screen.
+    Add(Deadline),
 }
 
 /// One selectable row on the menu, and what choosing it does.
@@ -168,8 +163,75 @@ pub enum MenuKind {
     Counter,
     /// The wall clock.
     Clock,
+    /// A section heading: drawn, never chosen.
+    Head,
+    /// The saved deadline with this index in the caller's list.
+    Deadline(usize),
+    /// The countdown to the turn of the year, which is always there.
+    Year,
+    /// The row that opens the add-a-deadline form.
+    Add,
     /// Load the phrases out of this file and switch to the words.
     File(PathBuf),
+}
+
+/// The add-a-deadline form: three fields, filled in one at a time.
+///
+/// Typing goes into the highlighted field; the date and time take digits and
+/// separators only, so a stray letter cannot build a stamp that will not
+/// parse. What is typed is checked all at once on `enter`, the way a form
+/// this small should be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Form {
+    /// 0 is the name, 1 the date, 2 the time.
+    pub field: usize,
+    pub name: String,
+    /// `YYYY-MM-DD`, so the shape is what is written to the file.
+    pub date: String,
+    /// `HH:MM`.
+    pub time: String,
+    /// Why the last commit was refused, until something is typed again.
+    pub err: Option<String>,
+    /// The stamp fields arrive pre-filled with a default. Until a character is
+    /// typed into one of them it holds a placeholder, and the first keystroke
+    /// replaces it -- otherwise a form opened on tomorrow's date would swallow
+    /// every digit of the date you actually wanted, because the field was
+    /// already full. The name never has this problem: it starts empty.
+    pub fresh: [bool; 2],
+}
+
+impl Form {
+    /// Tonight's tomorrow, pre-filled: a deadline someone is adding by hand
+    /// is most often due tomorrow, and the time is the end of a day.
+    pub fn defaults(wall: &Wall) -> Form {
+        let (y, m, d) = time::tomorrow(wall);
+        Form {
+            field: 0,
+            name: String::new(),
+            date: format!("{y:04}-{m:02}-{d:02}"),
+            time: "23:59".to_string(),
+            err: None,
+            fresh: [true, true],
+        }
+    }
+
+    fn slot(&mut self, i: usize) -> &mut String {
+        match i {
+            0 => &mut self.name,
+            1 => &mut self.date,
+            _ => &mut self.time,
+        }
+    }
+
+    /// How much room each field has: a name is prose, the others are stamps
+    /// with a fixed width that fills in as you type.
+    fn cap(i: usize) -> usize {
+        match i {
+            0 => 20,
+            1 => 10,
+            _ => 5,
+        }
+    }
 }
 
 pub struct Glyph {
@@ -248,6 +310,10 @@ pub struct Engine {
     /// The current wall-clock reading, handed in from outside so the engine
     /// never has to ask the system for the time itself.
     pub wall: Wall,
+    /// The reading behind `wall` and `left`, in seconds: local and UTC. The
+    /// difference between them is the offset a deadline is pinned against.
+    pub local: i64,
+    pub utc: i64,
     /// The font the words were using, so `T` can hand it back untouched. A
     /// clock wants the pixel font every time; the words should not inherit
     /// that choice on the way out.
@@ -263,6 +329,26 @@ pub struct Engine {
     /// Set for one frame when the alarm wants a bell. The frame loop owns the
     /// output buffer, so the engine raises a flag rather than writing bytes.
     pub beep: bool,
+    /// Seconds of alarm left after a countdown or a deadline hits zero, and
+    /// the countdown to the next beep. It lives on the engine rather than on
+    /// the `Timer` because a deadline rings a bell too.
+    pub alarm: f64,
+    pub beep_in: f64,
+
+    // -- the deadline ---------------------------------------------------------
+    /// Saved deadlines, handed in from the caller so the picker can name them
+    /// and the deletion keys know which one is which.
+    pub deadlines: Vec<Deadline>,
+    /// The countdown to the turn of the year, which is always worth having.
+    pub year: Option<Deadline>,
+    /// The deadline the screen is counting towards, if any.
+    pub target: Option<Deadline>,
+    /// Seconds until the target, kept fresh from outside whatever the screen
+    /// is doing -- so arriving at the deadline shows the true number on the
+    /// first frame rather than a stale one.
+    pub left: f64,
+    /// The add-a-deadline form, up while it is being filled in.
+    pub form: Option<Form>,
 
     // -- the menu -------------------------------------------------------------
     /// The picker: modes plus any phrase files found under the config dir.
@@ -321,11 +407,20 @@ impl Engine {
             mode: Mode::Words,
             timer: Timer::countdown(DEFAULT_TIMER),
             wall: Wall::from_local(0),
+            local: 0,
+            utc: 0,
             words_pixel: false,
             label_row: false,
             flash: 0.0,
             flash_glyph: 0,
             beep: false,
+            alarm: 0.0,
+            beep_in: 0.0,
+            deadlines: Vec::new(),
+            year: None,
+            target: None,
+            left: 0.0,
+            form: None,
             menu_open: false,
             menu: Vec::new(),
             menu_sel: 0,
@@ -549,7 +644,20 @@ impl Engine {
     }
 
     fn kick(&mut self) {
+        // Nothing tears while a panel is up: the overlay is redrawn every
+        // frame, so a glitch would be flashing through the very thing the user
+        // is trying to read. The burst resumes on its own after it goes away.
+        if self.overlay_up() {
+            return;
+        }
         self.glitch = self.glitch_soon(GLITCH_LEN.0, GLITCH_LEN.1);
+    }
+
+    /// Whether one of the panels -- the picker, the help sheet, the deadline
+    /// form -- is in front of the words. They are the one thing the ambient
+    /// animation must not play through.
+    pub fn overlay_up(&self) -> bool {
+        self.menu_open || self.help || self.form.is_some()
     }
 
     // -- the clock -----------------------------------------------------------
@@ -573,11 +681,32 @@ impl Engine {
         }
     }
 
+    /// A remaining time with a days field on the front, for the spans a
+    /// deadline can have: `72:11:22:05` reads days, hours, minutes, seconds.
+    /// Under a day it is just `HH:MM:SS` -- a days field of zero would be a
+    /// digit with nothing to say.
+    pub fn countdown(secs: f64) -> String {
+        let s = secs.max(0.0) as u64;
+        let (d, h, m, ss) = (s / 86_400, (s / 3600) % 24, (s / 60) % 60, s % 60);
+        if d > 0 {
+            format!("{d:02}:{h:02}:{m:02}:{ss:02}")
+        } else {
+            format!("{h:02}:{m:02}:{ss:02}")
+        }
+    }
+
     fn digits_text(&self) -> String {
         match self.mode {
             Mode::Clock => self.wall.hms(),
+            Mode::Deadline => Self::countdown(self.left),
             _ => Self::hms(self.timer.value),
         }
+    }
+
+    /// The alarm is what a zero means while it lasts; after that the clock is
+    /// just sitting on zero, still `Done`, still waiting for a reset.
+    pub fn alarming(&self) -> bool {
+        self.alarm > 0.0
     }
 
     /// Which way the numbers are going, for the strip and the caption.
@@ -597,7 +726,19 @@ impl Engine {
             return None;
         }
         match self.mode {
-            Mode::Clock => Some(self.wall.date()),
+            Mode::Clock => Some(format!(
+                "{} · {:.1}% GONE",
+                self.wall.date(),
+                time::year_stats(self.local).0
+            )),
+            Mode::Deadline => Some(match &self.target {
+                // Named and dated, because "72:11:22:05" on its own does not
+                // say what it is that is nearly upon you.
+                Some(t) if self.phase != Phase::Done => {
+                    format!("{} · {}", t.name, t.stamp())
+                }
+                _ => "TIME'S UP".to_string(),
+            }),
             Mode::Timer => Some(match self.phase {
                 Phase::Done => "TIME'S UP".to_string(),
                 _ if self.timer.down => "COUNTDOWN".to_string(),
@@ -709,7 +850,7 @@ impl Engine {
 
     /// Start in wall-clock mode: the actual time, running because it is time.
     ///
-    /// The reading itself is fed in with [`set_wall`], so this only has to put
+    /// The reading itself is fed in with [`set_now`], so this only has to put
     /// the digits on screen.
     pub fn start_clock(&mut self) {
         if self.mode == Mode::Words {
@@ -723,15 +864,59 @@ impl Engine {
         self.load_digits();
     }
 
-    /// Take a fresh wall-clock reading. The digits re-lay only when the second
-    /// (or the date) actually changes, so the common case is a compare.
-    pub fn set_wall(&mut self, wall: Wall) {
-        if wall == self.wall {
-            return;
+    /// Count down to a saved deadline. There is nothing to arm: a deadline
+    /// runs whether you are watching or not, so it comes up running -- or
+    /// already `Done`, silently, if the moment went by without you.
+    pub fn start_deadline(&mut self, t: Deadline) {
+        if self.mode == Mode::Words {
+            self.words_pixel = self.pixel;
         }
-        self.wall = wall;
-        if self.mode == Mode::Clock {
-            self.sync_digits();
+        self.mode = Mode::Deadline;
+        self.pixel = true;
+        self.left = (t.at - self.utc).max(0) as f64;
+        self.phase = if self.left <= 0.0 {
+            Phase::Done
+        } else {
+            Phase::Running
+        };
+        self.alarm = 0.0;
+        self.beep_in = 0.0;
+        self.target = Some(t);
+        self.flash = 0.0;
+        self.load_digits();
+    }
+
+    /// Take a fresh reading of the real clock: `utc` seconds since the epoch
+    /// and the machine's offset east of it. The wall clock and any deadline
+    /// both hang off this one reading, and it keeps `left` true even while the
+    /// words are on screen, so a deadline never shows a stale number on the
+    /// frame you arrive on.
+    pub fn set_now(&mut self, utc: i64, offset: i64) {
+        self.utc = utc;
+        self.local = utc + offset;
+
+        if let Some(at) = self.target.as_ref().map(|t| t.at) {
+            let left = (at - utc).max(0) as f64;
+            // The moment passing while you are looking at it is the alarm;
+            // passing unnoticed leaves it quietly `Done` for next time.
+            if left <= 0.0 && self.left > 0.0 && self.mode == Mode::Deadline {
+                self.left = 0.0;
+                self.fire_alarm();
+                self.sync_digits();
+            } else {
+                self.left = left;
+                if self.mode == Mode::Deadline {
+                    self.sync_digits();
+                }
+            }
+        }
+
+        let wall = Wall::from_local(self.local);
+        if wall != self.wall {
+            self.wall = wall;
+            if self.mode == Mode::Clock {
+                self.sync_digits();
+            }
         }
     }
 
@@ -742,8 +927,8 @@ impl Engine {
         } else {
             0.0
         };
-        self.timer.alarm = 0.0;
-        self.timer.beep_in = 0.0;
+        self.alarm = 0.0;
+        self.beep_in = 0.0;
         self.phase = Phase::Ready;
         self.flash = 0.0;
     }
@@ -772,8 +957,8 @@ impl Engine {
         // The alarm belonged to the run that just finished, so it goes with it.
         // Everything else is left alone: stopping the clock to change your mind
         // about which way it runs would be a nasty surprise halfway through.
-        self.timer.alarm = 0.0;
-        self.timer.beep_in = 0.0;
+        self.alarm = 0.0;
+        self.beep_in = 0.0;
         if self.phase == Phase::Done {
             self.phase = Phase::Ready;
         }
@@ -808,8 +993,8 @@ impl Engine {
             // Shortened past zero is a countdown that is over, not one that has
             // run backwards into time it never had.
             self.phase = Phase::Done;
-            self.timer.alarm = ALARM_TIME;
-            self.timer.beep_in = 0.0;
+            self.alarm = ALARM_TIME;
+            self.beep_in = 0.0;
         } else if self.phase == Phase::Done {
             self.phase = Phase::Ready;
         }
@@ -817,53 +1002,73 @@ impl Engine {
         self.load_digits();
     }
 
-    /// Advance the clock, ring the alarm, and re-lay the digits if they moved.
-    fn update_timer(&mut self, dt: f64) {
+    /// Light the digit that moved, and let the light die down.
+    fn tick_flash(&mut self, dt: f64) {
         if self.flash > 0.0 {
             self.flash = (self.flash - dt / FLASH_TIME).max(0.0);
         }
+    }
 
-        match self.phase {
-            Phase::Running => {
-                if self.timer.down {
-                    self.timer.value -= dt;
-                    if self.timer.value <= 0.0 {
-                        self.timer.value = 0.0;
-                        self.phase = Phase::Done;
-                        self.timer.alarm = ALARM_TIME;
-                        self.timer.beep_in = 0.0;
-                        self.kick();
-                    }
-                } else {
-                    self.timer.value += dt;
-                }
-            }
-            Phase::Done if self.timer.alarm > 0.0 => {
-                self.timer.alarm -= dt;
-                // Bursts every 0.4s rather than the ambient 4-11s: the alarm is
-                // the one moment the screen is allowed to come apart. The
-                // ambient scheduler will re-arm it with its own longer delay,
-                // and the clamp below takes it back down next frame.
-                self.next_glitch = self.next_glitch.min(0.4);
-                self.timer.beep_in -= dt;
-                if self.timer.beep_in <= 0.0 {
-                    self.timer.beep_in = 1.0;
-                    self.beep = true;
-                }
-            }
-            _ => {}
+    /// A clock has just run out: start the strobe and the bells. The first bell
+    /// rings on this frame rather than the next, so a countdown landing rings
+    /// the moment it lands.
+    fn fire_alarm(&mut self) {
+        self.phase = Phase::Done;
+        self.alarm = ALARM_TIME;
+        self.beep_in = 1.0;
+        self.beep = true;
+        self.kick();
+    }
+
+    /// Run the alarm down while it lasts: a glitch burst every 0.4s (rather
+    /// than the ambient 4-11s -- the alarm is the one moment the screen is
+    /// allowed to come apart) and a bell a second.
+    fn alarm_tick(&mut self, dt: f64) {
+        if self.phase != Phase::Done || self.alarm <= 0.0 {
+            return;
         }
+        self.alarm -= dt;
+        // The ambient scheduler will re-arm with its own longer delay, and the
+        // clamp here takes it back down next frame.
+        self.next_glitch = self.next_glitch.min(0.4);
+        self.beep_in -= dt;
+        if self.beep_in <= 0.0 {
+            self.beep_in = 1.0;
+            self.beep = true;
+        }
+    }
 
+    /// Advance the clock, ring the alarm, and re-lay the digits if they moved.
+    fn update_timer(&mut self, dt: f64) {
+        self.tick_flash(dt);
+        if self.phase == Phase::Running {
+            if self.timer.down {
+                self.timer.value -= dt;
+                if self.timer.value <= 0.0 {
+                    self.timer.value = 0.0;
+                    self.fire_alarm();
+                }
+            } else {
+                self.timer.value += dt;
+            }
+        }
+        self.alarm_tick(dt);
         self.sync_digits();
+    }
+
+    /// A deadline does not advance its own value -- the seconds are fed in
+    /// from outside, the way the wall clock's are -- so what ticks over here
+    /// is only the flash on the digit that moved and any alarm still sounding.
+    fn update_deadline(&mut self, dt: f64) {
+        self.tick_flash(dt);
+        self.alarm_tick(dt);
     }
 
     /// A wall clock does not advance its own value -- the second is fed in from
     /// outside -- so all that ticks over here is the flash on the digit that
     /// moved.
     fn update_clock(&mut self, dt: f64) {
-        if self.flash > 0.0 {
-            self.flash = (self.flash - dt / FLASH_TIME).max(0.0);
-        }
+        self.tick_flash(dt);
     }
 
     /// The frame loop asks once per frame and writes the bell itself.
@@ -883,21 +1088,35 @@ impl Engine {
         // The word fading in / out.
         self.vis += (self.vis_target - self.vis) * (dt * 3.4).min(1.0);
 
-        let was_glitching = self.glitch > 0.0;
-        if was_glitching {
-            self.glitch -= dt;
-            if self.glitch <= 0.0 {
-                // The final turbulent frame leaves debris; repaint once more.
+        // A panel in front of the words stops the ambient glitching dead: the
+        // overlay is repainted every frame, so a burst would flicker through
+        // whatever is being read. Any burst already under way is cut short --
+        // once, with the one repaint that clears its debris -- and the timer is
+        // parked so the moment the panel goes the storms do not all arrive at
+        // once.
+        if self.overlay_up() {
+            if self.glitch > 0.0 {
                 self.glitch = 0.0;
                 self.full = true;
-            } else {
-                self.full = true;
             }
-        }
-        self.next_glitch -= dt;
-        if self.next_glitch <= 0.0 {
-            self.next_glitch = self.glitch_soon(GLITCH_AMBIENT.0, GLITCH_AMBIENT.1);
-            self.kick();
+            self.next_glitch = GLITCH_AMBIENT.0;
+        } else {
+            let was_glitching = self.glitch > 0.0;
+            if was_glitching {
+                self.glitch -= dt;
+                if self.glitch <= 0.0 {
+                    // The final turbulent frame leaves debris; repaint once more.
+                    self.glitch = 0.0;
+                    self.full = true;
+                } else {
+                    self.full = true;
+                }
+            }
+            self.next_glitch -= dt;
+            if self.next_glitch <= 0.0 {
+                self.next_glitch = self.glitch_soon(GLITCH_AMBIENT.0, GLITCH_AMBIENT.1);
+                self.kick();
+            }
         }
 
         self.hud += (self.hud_target - self.hud) * (dt * 7.0).min(1.0);
@@ -917,7 +1136,7 @@ impl Engine {
                     // up armed and waiting and the wall clock starts running.
                     self.phase = match self.mode {
                         Mode::Timer => Phase::Ready,
-                        Mode::Clock => Phase::Running,
+                        Mode::Clock | Mode::Deadline => Phase::Running,
                         Mode::Words => Phase::Typing,
                     };
                     self.full = true;
@@ -976,6 +1195,7 @@ impl Engine {
         // typewriter's match rather than inside it.
         match self.mode {
             Mode::Timer => self.update_timer(dt),
+            Mode::Deadline => self.update_deadline(dt),
             Mode::Clock => self.update_clock(dt),
             Mode::Words => {}
         }
@@ -1007,6 +1227,11 @@ impl Engine {
 
     pub fn key(&mut self, b: u8) -> Action {
         self.idle = 0.0;
+        // The form, like the picker, owns the keyboard outright: a stray `W`
+        // should go into the name field, not into the typing speed behind it.
+        if self.form.is_some() {
+            return self.form_key(b);
+        }
         // While the picker is up it owns the keyboard: a stray `W` should move
         // the selection, not the typing speed behind the panel.
         if self.menu_open {
@@ -1027,7 +1252,9 @@ impl Engine {
             b'b' | b'B' => self.pin = !self.pin,
             b'f' | b'F' => self.toggle_font(),
             _ if self.mode == Mode::Timer => self.timer_key(b),
-            _ if self.mode == Mode::Clock => self.clock_key(b),
+            _ if self.mode == Mode::Clock || self.mode == Mode::Deadline => {
+                self.clock_key(b)
+            }
             _ => self.words_key(b),
         }
         Action::None
@@ -1040,15 +1267,20 @@ impl Engine {
             Mode::Words => "WORDS",
             Mode::Timer => "COUNTER",
             Mode::Clock => "CLOCK",
+            Mode::Deadline => "DEADLINE",
         }
     }
 
-    /// `T` walks the three modes in a ring.
+    /// `T` walks the modes in a ring. The deadline is only worth walking to
+    /// when there is one to show -- the picker always offers the turn of the
+    /// year, but a bare engine with no deadlines should not dead-end there.
     fn cycle_mode(&mut self) {
         let next = match self.mode {
             Mode::Words => Mode::Timer,
             Mode::Timer => Mode::Clock,
+            Mode::Clock if self.target.is_some() || self.year.is_some() => Mode::Deadline,
             Mode::Clock => Mode::Words,
+            Mode::Deadline => Mode::Words,
         };
         self.set_mode(next);
         self.notice = Some((self.mode_name().to_string(), 2.0));
@@ -1091,6 +1323,18 @@ impl Engine {
                 self.load_digits();
             }
             Mode::Clock => self.start_clock(),
+            Mode::Deadline => {
+                // The one the picker last chose, or the turn of the year if
+                // none has been chosen yet -- arriving here from `T` should
+                // always land on something worth counting down to.
+                let t = self
+                    .target
+                    .clone()
+                    .or_else(|| self.year.clone());
+                if let Some(t) = t {
+                    self.start_deadline(t);
+                }
+            }
         }
         self.full = true;
         self.idle = 0.0;
@@ -1105,6 +1349,15 @@ impl Engine {
         self.menu = items;
         if self.menu_sel >= self.menu.len() {
             self.menu_sel = self.menu.len().saturating_sub(1);
+        }
+        // Headings are drawn but never chosen, so the selection starts on a
+        // row that actually opens something.
+        while self.menu.get(self.menu_sel).is_some_and(|m| m.kind == MenuKind::Head) {
+            if self.menu_sel + 1 < self.menu.len() {
+                self.menu_sel += 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -1121,22 +1374,46 @@ impl Engine {
         self.full = true;
     }
 
+    /// Step the selection, skipping over the section headings.
+    fn menu_move(&mut self, dir: isize) {
+        let n = self.menu.len() as isize;
+        if n == 0 {
+            return;
+        }
+        let mut i = self.menu_sel as isize;
+        for _ in 0..n {
+            i = (i + dir).rem_euclid(n);
+            if self.menu[i as usize].kind != MenuKind::Head {
+                self.menu_sel = i as usize;
+                return;
+            }
+        }
+    }
+
+    /// The menu index of the n-th selectable row, for the number keys.
+    fn menu_nth(&self, n: usize) -> Option<usize> {
+        self.menu
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.kind != MenuKind::Head)
+            .map(|(i, _)| i)
+            .nth(n)
+    }
+
     /// Keys that only mean something while the picker is up.
     fn menu_key(&mut self, b: u8) -> Action {
-        let n = self.menu.len();
         match b {
             b'q' | b'Q' | 0x03 | 0x04 => return Action::Quit,
             b'm' | b'M' | 0x1b => self.close_menu(),
-            KEY_UP | b'k' | b'K' | b'w' | b'W' => {
-                self.menu_sel = self.menu_sel.saturating_sub(1);
-            }
-            KEY_DOWN | b'j' | b'J' | b's' | b'S' if n > 0 => {
-                self.menu_sel = (self.menu_sel + 1).min(n - 1);
-            }
+            KEY_UP | b'k' | b'K' | b'w' | b'W' => self.menu_move(-1),
+            KEY_DOWN | b'j' | b'J' | b's' | b'S' => self.menu_move(1),
             b' ' | b'\n' | b'\r' => return self.choose_menu(),
+            // Delete the deadline under the selection. On any other row it
+            // means nothing, and doing nothing is right: `x` next to a list
+            // of phrase files should not delete the phrase files.
+            b'x' | b'X' => return self.menu_delete(),
             b'1'..=b'9' => {
-                let i = (b - b'1') as usize;
-                if i < n {
+                if let Some(i) = self.menu_nth((b - b'1') as usize) {
                     self.menu_sel = i;
                     return self.choose_menu();
                 }
@@ -1146,28 +1423,168 @@ impl Engine {
         Action::None
     }
 
-    /// Act on the highlighted row. The three built-in rows switch mode here;
-    /// a file has to be read by the caller, so it is handed back as an action.
+    /// The `x` key: forget the highlighted deadline, if that is what it is.
+    fn menu_delete(&mut self) -> Action {
+        match self.menu.get(self.menu_sel).map(|m| m.kind.clone()) {
+            Some(MenuKind::Deadline(i)) => {
+                self.close_menu();
+                Action::Forget(i)
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Act on the highlighted row. The built-in rows switch mode here; files,
+    /// deletions and new deadlines belong to the caller, which hands them
+    /// back as actions.
     fn choose_menu(&mut self) -> Action {
         let Some(item) = self.menu.get(self.menu_sel).cloned() else {
             self.close_menu();
             return Action::None;
         };
+        match &item.kind {
+            MenuKind::Head => return Action::None,
+            MenuKind::Add => {
+                self.close_menu();
+                self.form = Some(Form::defaults(&self.wall));
+                self.full = true;
+                return Action::None;
+            }
+            MenuKind::Year => {
+                self.close_menu();
+                if let Some(t) = self.year.clone() {
+                    self.start_deadline(t);
+                    self.notice = Some((item.label, 2.0));
+                }
+                return Action::None;
+            }
+            MenuKind::Deadline(i) => {
+                self.close_menu();
+                if let Some(t) = self.deadlines.get(*i).cloned() {
+                    self.notice = Some((t.name.clone(), 2.0));
+                    self.start_deadline(t);
+                }
+                return Action::None;
+            }
+            _ => {}
+        }
         self.close_menu();
         let mode = match &item.kind {
             MenuKind::Words => Mode::Words,
             MenuKind::Counter => Mode::Timer,
             MenuKind::Clock => Mode::Clock,
             MenuKind::File(path) => return Action::OpenFile(path.clone()),
+            // Handled above; the match only has to be exhaustive.
+            MenuKind::Head | MenuKind::Year | MenuKind::Deadline(_) | MenuKind::Add => {
+                return Action::None
+            }
         };
         self.set_mode(mode);
         self.notice = Some((item.label, 2.0));
         Action::None
     }
 
+    // -- the form ------------------------------------------------------------
+
+    /// Keys that only mean something while the add-a-deadline form is up.
+    fn form_key(&mut self, b: u8) -> Action {
+        if self.form.is_none() {
+            return Action::None;
+        }
+        match b {
+            0x03 | 0x04 => return Action::Quit,
+            0x1b => {
+                self.form = None;
+                self.full = true;
+            }
+            b'\n' | b'\r' => return self.form_commit(),
+            b'\t' | KEY_RIGHT => {
+                if let Some(f) = self.form.as_mut() {
+                    f.field = (f.field + 1) % 3;
+                }
+            }
+            KEY_LEFT => {
+                if let Some(f) = self.form.as_mut() {
+                    f.field = (f.field + 2) % 3;
+                }
+            }
+            0x7f | 0x08 => {
+                if let Some(f) = self.form.as_mut() {
+                    f.slot(f.field).pop();
+                    // A backspace is an edit like any other: whatever is left
+                    // is what the user wants, not a placeholder to be wiped.
+                    if f.field > 0 {
+                        f.fresh[f.field - 1] = false;
+                    }
+                    f.err = None;
+                }
+            }
+            c if c.is_ascii_graphic() || c == b' ' => {
+                // The date and the time take the characters a stamp is made
+                // of, so no stray letter can build something that will not
+                // parse and then sit there refusing to save.
+                if let Some(f) = self.form.as_mut() {
+                    let ok = f.field == 0 || matches!(c, b'-' | b':' | b'0'..=b'9');
+                    // The first keystroke into a pre-filled stamp clears the
+                    // default, so typing a date just works instead of landing
+                    // in a field that was already full.
+                    if ok && f.field > 0 && f.fresh[f.field - 1] {
+                        f.slot(f.field).clear();
+                        f.fresh[f.field - 1] = false;
+                    }
+                    let room = f.slot(f.field).chars().count() < Form::cap(f.field);
+                    if ok && room {
+                        f.slot(f.field).push(c as char);
+                        f.err = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.full = true;
+        Action::None
+    }
+
+    /// Check the form over and hand back a deadline, or keep it up and say
+    /// what was wrong. An empty time is midnight; an empty name is whatever
+    /// the deadline is about, which the date alone nearly always says.
+    fn form_commit(&mut self) -> Action {
+        let Some(f) = self.form.take() else {
+            return Action::None;
+        };
+        let mut name: String = f
+            .name
+            .trim()
+            .chars()
+            .filter(|c| *c != '|')
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if name.is_empty() {
+            name = "DEADLINE".to_string();
+        }
+        let when = if f.time.trim().is_empty() {
+            format!("{} 00:00", f.date)
+        } else {
+            format!("{} {}", f.date, f.time)
+        };
+        match time::parse_when(&when) {
+            Some((y, m, d, h, min)) => {
+                let offset = self.local - self.utc;
+                Action::Add(Deadline::at(name, y, m, d, h, min, offset))
+            }
+            None => {
+                let mut f = f;
+                f.err = Some("THAT IS NOT A DATE".to_string());
+                self.form = Some(f);
+                self.full = true;
+                Action::None
+            }
+        }
+    }
+
     fn toggle_font(&mut self) {
         self.pixel = !self.pixel;
-        if matches!(self.mode, Mode::Timer | Mode::Clock) {
+        if matches!(self.mode, Mode::Timer | Mode::Clock | Mode::Deadline) {
             self.load_digits();
             return;
         }
@@ -1236,10 +1653,16 @@ impl Engine {
     }
 
     /// The bar shows while you're using it and leaves three seconds after your
-    /// last keypress. `pin`, auto-ramp, the help panel and the open menu all
-    /// hold it open.
+    /// last keypress. `pin`, auto-ramp, the help panel, the open menu and the
+    /// add-a-deadline form all hold it open.
     pub fn hide_hud(&mut self) {
-        let want = if self.pin || self.rapid || self.help || self.menu_open || self.idle < HUD_IDLE {
+        let want = if self.pin
+            || self.rapid
+            || self.help
+            || self.menu_open
+            || self.form.is_some()
+            || self.idle < HUD_IDLE
+        {
             1.0
         } else {
             0.0
@@ -1595,14 +2018,14 @@ mod tests {
         let mut e = running(80, 24, true, 10.0);
         run(&mut e, 11.0);
         assert_eq!(e.phase, Phase::Done);
-        assert!(e.timer.alarming());
+        assert!(e.alarming());
         // Bells earned while it was alarming are not taken back -- the frame
         // loop writes them as they happen -- so clear what is pending first.
         while e.take_beep() {}
 
         e.key(b'u');
         assert_eq!(e.phase, Phase::Ready, "the alarm went with the old direction");
-        assert!(!e.timer.alarming());
+        assert!(!e.alarming());
         assert!(!e.take_beep(), "and it rings no more bells");
         assert_eq!(e.text, "00:00");
         assert_eq!(e.label_text().as_deref(), Some("STOPWATCH"));
@@ -1682,7 +2105,7 @@ mod tests {
         }
         assert_eq!(rings, during, "and then it goes quiet for good");
         assert_eq!(e.phase, Phase::Done, "still sitting on zero");
-        assert!(!e.timer.alarming(), "the strobe has stopped too");
+        assert!(!e.alarming(), "the strobe has stopped too");
     }
 
     #[test]
@@ -1790,9 +2213,13 @@ mod tests {
         e.key(b't');
         assert_eq!(e.mode, Mode::Clock);
         assert!(e.pixel, "and so does the wall clock");
-        e.set_wall(Wall::from_local(0));
+        e.set_now(0, 0);
         assert_eq!(e.text, "00:00:00", "the wall reading is what is on screen");
-        assert_eq!(e.label_text().as_deref(), Some("THU 1970-01-01"));
+        assert_eq!(
+            e.label_text().as_deref(),
+            Some("THU 1970-01-01 · 0.0% GONE"),
+            "the date, and how much of the year that is"
+        );
 
         e.key(b't');
         assert_eq!(e.mode, Mode::Words);
@@ -1811,17 +2238,20 @@ mod tests {
         assert_eq!(e.phase, Phase::Running, "a wall clock is always running");
 
         // 1970-01-01T00:00:00Z, a Thursday.
-        e.set_wall(Wall::from_local(0));
+        e.set_now(0, 0);
         assert_eq!(e.text, "00:00:00");
-        assert_eq!(e.label_text().as_deref(), Some("THU 1970-01-01"));
+        assert_eq!(
+            e.label_text().as_deref(),
+            Some("THU 1970-01-01 · 0.0% GONE")
+        );
 
         // A second later the digits move on their own.
-        e.set_wall(Wall::from_local(1));
+        e.set_now(1, 0);
         assert_eq!(e.text, "00:00:01");
 
         // A reading that has not changed is a no-op, flash and all.
         e.flash = 0.0;
-        e.set_wall(Wall::from_local(1));
+        e.set_now(1, 0);
         assert_eq!(e.flash, 0.0, "the same second is not a new tick");
     }
 
@@ -2551,6 +2981,333 @@ mod tests {
             !frame.contains("INITIALISING"),
             "and the words are not drawn over a stranded boot bar"
         );
+    }
+
+    // -- the deadline ---------------------------------------------------------
+
+    /// The engine with a target a given number of seconds ahead of its zero
+    /// reading: `at = left`, so `set_now(0, 0)` puts exactly that much on the
+    /// clock.
+    fn due(left: i64) -> Deadline {
+        Deadline::at("RELEASE", 1970, 1, 1, 0, 0, 0);
+        let mut d = Deadline::at("RELEASE", 1970, 1, 1, 0, 0, 0);
+        d.at = left;
+        d
+    }
+
+    #[test]
+    fn a_deadline_counts_the_span_out_in_days_hours_minutes_seconds() {
+        // A little over a day: the days field turns up, hours wrap at 24.
+        assert_eq!(Engine::countdown(86_400.0 + 3661.0), "01:01:01:01");
+        // Under a day the days field would be a digit with nothing to say.
+        assert_eq!(Engine::countdown(3661.0), "01:01:01");
+        assert_eq!(Engine::countdown(59.0), "00:00:59");
+        // Years out is still just more days.
+        assert_eq!(Engine::countdown(400.0 * 86_400.0), "400:00:00:00");
+        // And a deadline gone by reads as none left, never as a minus.
+        assert_eq!(Engine::countdown(-5.0), "00:00:00");
+    }
+
+    #[test]
+    fn choosing_a_deadline_puts_it_on_screen_and_counts_it() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.start_deadline(due(86_400 + 90));
+        assert_eq!(e.mode, Mode::Deadline);
+        assert_eq!(e.phase, Phase::Running, "a deadline runs by itself");
+        assert!(e.pixel, "and it wants the big font like a clock does");
+        assert_eq!(e.text, "01:00:01:30", "a day, a minute and a half");
+
+        // The digits come from outside, and none of them are invented here.
+        e.set_now(30, 0);
+        assert_eq!(e.text, "01:00:01:00");
+    }
+
+    #[test]
+    fn a_deadline_that_passes_alarms_and_a_deadline_already_past_does_not() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.start_deadline(due(2));
+        assert_eq!(e.phase, Phase::Running);
+        assert!(!e.alarming());
+
+        e.set_now(2, 0);
+        assert_eq!(e.phase, Phase::Done, "the moment landing is the finish");
+        assert_eq!(e.text, "00:00:00");
+        assert!(e.alarming(), "and it rings");
+        assert!(e.take_beep(), "a bell on the frame it lands");
+
+        // A deadline chosen after it has gone is over, quietly -- nobody
+        // wants a strobe for a bus they have already missed.
+        let mut e2 = eng(80, 24);
+        e2.set_now(10, 0);
+        e2.start_deadline(due(0));
+        assert_eq!(e2.phase, Phase::Done);
+        assert_eq!(e2.text, "00:00:00");
+        assert!(!e2.alarming(), "no alarm for a moment already gone");
+        assert!(!e2.take_beep());
+    }
+
+    #[test]
+    fn the_deadline_caption_says_what_it_is_counting_to() {
+        let mut e = eng(80, 24);
+        e.label_row = true;
+        e.set_now(0, 0);
+        e.start_deadline(Deadline::at("RELEASE DAY", 2027, 3, 4, 9, 30, 0));
+        assert_eq!(e.label_text().as_deref(), Some("RELEASE DAY · 2027-03-04 09:30"));
+    }
+
+    #[test]
+    fn t_walks_four_modes_once_there_is_a_deadline_to_walk_to() {
+        let mut e = eng(80, 24);
+        e.set_now(100, 0);
+        e.year = Some(due(1000));
+        e.deadlines = vec![due(500)];
+
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Timer);
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Clock);
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Deadline, "the ring is four long with one to show");
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Words, "and it comes back round");
+    }
+
+    #[test]
+    fn a_deadline_is_only_walked_to_when_there_is_one() {
+        // A bare engine has no year and no deadlines: `T` stays a three-step.
+        let mut e = eng(80, 24);
+        e.key(b't');
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Clock);
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Words, "nothing to count down to, so nowhere to stop");
+    }
+
+    #[test]
+    fn the_menu_sections_are_never_chosen_but_are_stepped_over() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.year = Some(due(1000));
+        e.deadlines = vec![due(500)];
+        e.set_menu(vec![
+            MenuItem::new("MODES", MenuKind::Head),
+            MenuItem::new("WORDS", MenuKind::Words),
+            MenuItem::new("CLOCK", MenuKind::Clock),
+            MenuItem::new("DEADLINES", MenuKind::Head),
+            MenuItem::new("END OF YEAR", MenuKind::Year),
+            MenuItem::new("RELEASE", MenuKind::Deadline(0)),
+            MenuItem::new("+ ADD A DEADLINE", MenuKind::Add),
+        ]);
+
+        assert_eq!(e.menu_sel, 1, "the selection opens on the first real row");
+        e.key(b'm');
+        assert!(e.menu_open);
+        e.key(b'j');
+        assert_eq!(e.menu_sel, 2);
+        e.key(b'j');
+        assert_eq!(e.menu_sel, 4, "the DEADLINES heading is stepped over");
+        e.key(b'k');
+        assert_eq!(e.menu_sel, 2, "and so is it on the way back");
+        e.key(b'k');
+        assert_eq!(e.menu_sel, 1);
+    }
+
+    #[test]
+    fn a_number_key_counts_only_the_rows_that_open() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.year = Some(due(1000));
+        e.set_menu(vec![
+            MenuItem::new("MODES", MenuKind::Head),
+            MenuItem::new("WORDS", MenuKind::Words),
+            MenuItem::new("CLOCK", MenuKind::Clock),
+            MenuItem::new("DEADLINES", MenuKind::Head),
+            MenuItem::new("END OF YEAR", MenuKind::Year),
+        ]);
+
+        e.key(b'm');
+        // Three selectable rows: WORDS, CLOCK, END OF YEAR.
+        e.key(b'3');
+        assert_eq!(e.mode, Mode::Deadline, "three is the third that opens, not the third row");
+        assert!(!e.menu_open);
+    }
+
+    #[test]
+    fn the_delete_key_forgets_a_deadline_and_nothing_else() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.deadlines = vec![due(500)];
+        e.set_menu(vec![
+            MenuItem::new("MODES", MenuKind::Head),
+            MenuItem::new("WORDS", MenuKind::Words),
+            MenuItem::new("DEADLINES", MenuKind::Head),
+            MenuItem::new("RELEASE", MenuKind::Deadline(0)),
+            MenuItem::new("+ ADD A DEADLINE", MenuKind::Add),
+        ]);
+
+        e.key(b'm');
+        e.key(b'x');
+        assert!(matches!(e.key(b'x'), Action::None), "on WORDS, x does nothing");
+
+        e.key(b'j');
+        assert_eq!(e.menu_sel, 3, "down onto the saved deadline");
+        let action = e.key(b'x');
+        match action {
+            Action::Forget(i) => assert_eq!(i, 0, "the caller is told which one"),
+            _ => panic!("x on a deadline should hand back a deletion"),
+        }
+        assert!(!e.menu_open, "and close the picker");    }
+
+    #[test]
+    fn the_add_row_opens_the_form_and_the_form_saves_a_deadline() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.set_menu(vec![
+            MenuItem::new("CLOCK", MenuKind::Clock),
+            MenuItem::new("+ ADD A DEADLINE", MenuKind::Add),
+        ]);
+
+        e.key(b'm');
+        e.key(b'2');
+        let f = e.form.clone().expect("the add row opens the form");
+        assert_eq!(f.field, 0);
+        assert_eq!(f.date, "1970-01-02", "tomorrow, from the reading in");
+        assert_eq!(f.time, "23:59");
+        assert!(!e.menu_open, "and the picker gets out of the way");
+
+        // Type a name, then a date straight over the placeholder the form
+        // opened with -- no rubbing out first.
+        for c in b"LAUNCH" {
+            e.key(*c);
+        }
+        e.key(b'\t');
+        for c in b"1970-03-04" {
+            e.key(*c);
+        }
+        // And a time, over the end-of-tomorrow the form started with.
+        e.key(b'\t');
+        for c in b"06:30" {
+            e.key(*c);
+        }
+        assert_eq!(e.form.as_ref().unwrap().field, 2);
+        let action = e.key(b'\n');
+        match action {
+            Action::Add(d) => {
+                assert_eq!(d.name, "LAUNCH");
+                assert_eq!((d.y, d.m, d.d, d.h, d.min), (1970, 3, 4, 6, 30));
+            }
+            _ => panic!("a filled-in form should hand back a deadline"),
+        }
+        assert!(e.form.is_none(), "and the form comes down");
+    }
+
+    #[test]
+    fn a_form_that_does_not_read_as_a_date_stays_up_and_says_so() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.set_menu(vec![MenuItem::new("+ ADD A DEADLINE", MenuKind::Add)]);
+        e.key(b'm');
+        e.key(b'\n');
+
+        e.key(b'\t');
+        for c in b"1970-02-30" {
+            e.key(*c);
+        }
+        let action = e.key(b'\n');
+        assert!(matches!(action, Action::None), "nothing is handed back");
+        let f = e.form.as_ref().expect("the form is still up");
+        assert_eq!(f.err.as_deref(), Some("THAT IS NOT A DATE"));
+
+        // Typing again clears the complaint.
+        e.key(0x7f);
+        assert_eq!(e.form.as_ref().unwrap().err, None);
+    }
+
+    #[test]
+    fn the_form_takes_its_fields_one_at_a_time_and_esc_lets_go() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.set_menu(vec![MenuItem::new("+ ADD A DEADLINE", MenuKind::Add)]);
+        e.key(b'm');
+        e.key(b'\n');
+
+        for c in b"PARTY" {
+            e.key(*c);
+        }
+        assert_eq!(e.form.as_ref().unwrap().name, "PARTY");
+        // The date and the time take the characters a stamp is made of.
+        e.key(b'\t');
+        e.key(b'q');
+        assert_eq!(e.form.as_ref().unwrap().date, "1970-01-02", "a letter is refused");
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        e.key(0x7f);
+        assert_eq!(e.form.as_ref().unwrap().date, "", "backspace rubs it out");
+
+        e.key(0x1b);
+        assert!(e.form.is_none(), "esc abandons the whole thing");
+        assert!(!e.take_beep());
+    }
+
+    #[test]
+    fn the_first_key_into_a_prefilled_stamp_replaces_the_default() {
+        // The date and time arrive filled in with tomorrow and 23:59. Typing
+        // into one has to overwrite that default: a field that is already full
+        // would otherwise silently swallow the stamp the user came to enter.
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.set_menu(vec![MenuItem::new("+ ADD A DEADLINE", MenuKind::Add)]);
+        e.key(b'm');
+        e.key(b'\n');
+
+        e.key(b'\t');
+        for c in b"2026-12-24" {
+            e.key(*c);
+        }
+        assert_eq!(e.form.as_ref().unwrap().date, "2026-12-24");
+        e.key(b'\t');
+        for c in b"18:30" {
+            e.key(*c);
+        }
+        assert_eq!(e.form.as_ref().unwrap().time, "18:30");
+
+        // Stepping past a stamp without touching it keeps the default.
+        let mut e2 = eng(80, 24);
+        e2.set_now(0, 0);
+        e2.set_menu(vec![MenuItem::new("+ ADD A DEADLINE", MenuKind::Add)]);
+        e2.key(b'm');
+        e2.key(b'\n');
+        e2.key(b'\t');
+        e2.key(b'\t');
+        assert_eq!(e2.form.as_ref().unwrap().date, "1970-01-02", "untouched keeps it");
+        assert_eq!(e2.form.as_ref().unwrap().time, "23:59", "untouched keeps it");
+    }
+
+    #[test]
+    fn a_deadline_shows_the_true_number_on_the_frame_it_arrives() {
+        // `left` is kept fresh even while the words are on screen, so T into
+        // the deadline does not flash a stale countdown.
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.year = Some(due(50));
+        run(&mut e, 9.0);
+
+        e.set_now(9, 0);
+        e.set_now(10, 0);
+        e.key(b't'); // Words -> Timer
+        e.key(b't'); // Timer -> Clock
+        e.key(b't'); // Clock -> Deadline (the year)
+        assert_eq!(e.mode, Mode::Deadline);
+        assert_eq!(e.text, "00:00:40", "the reading is current, not from before");
     }
 }
 

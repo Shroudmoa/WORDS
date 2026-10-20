@@ -62,6 +62,13 @@ pub fn label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// The file saved deadlines live in. Deliberately not a `.txt`: every `.txt`
+/// in the config directory is offered on the phrase menu, and a list of dates
+/// read out as phrases would be a strange afternoon.
+pub fn deadlines_file() -> Option<PathBuf> {
+    dir().map(|d| d.join("deadlines"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

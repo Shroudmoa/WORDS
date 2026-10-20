@@ -5,6 +5,7 @@
 //! fades away once you stop touching the keys.
 
 mod config;
+mod deadline;
 mod engine;
 mod font;
 mod phrases;
@@ -154,18 +155,32 @@ fn usage() {
     -h, --help          this text
 
   MODES
-    There are three things this program can be. `T` walks between them, or
+    There are four things this program can be. `T` walks between them, or
     press `M` for the picker and choose one directly:
 
         WORDS     the typewriter
         COUNTER   a countdown or a stopwatch
         CLOCK     the real time of day and the date
+        DEADLINE  how long is left until a saved moment
 
   COUNTER
         words --timer          a 25:00 countdown, armed and waiting
         words --timer 90       a minute and a half
         words --timer up       a stopwatch, counting up from zero
         words --timer down     the 25:00 countdown again
+
+  DEADLINES
+    `M` opens the picker, where the turn of the year is always the first
+    deadline (with how much of the year has gone), then your own, soonest
+    first. On a deadline row:
+
+        enter     count it down on screen
+        x         delete it (the file is rewritten)
+
+    `+ ADD A DEADLINE` asks for a name, a date (YYYY-MM-DD) and a time
+    (HH:MM), and remembers it in:
+
+        {dir}/deadlines
 
   PHRASES
     A words.txt in the working directory is used if --words is not given, and
@@ -262,17 +277,26 @@ fn main() {
     if args.clock {
         e.start_clock();
     }
-    e.set_menu(menu_items());
-    if args.menu {
-        e.open_menu();
-    }
     let mut watch = sources.watch.map(Watch::new);
 
     // The clock reads the real time, so it needs the machine's UTC offset; the
     // first reading is taken now so a startup clock doesn't flash midnight.
     let mut offset = time::local_offset();
     let mut offset_at = Instant::now();
-    e.set_wall(time::Wall::from_local(time::utc_now() + offset));
+    let local = time::utc_now() + offset;
+    e.set_now(local - offset, offset);
+
+    // Saved deadlines, and the turn of the year -- always on the picker, so
+    // "how much of the year is left" is a countdown like any other.
+    let mut deadlines = config::deadlines_file()
+        .map(|p| deadline::load(&p, offset))
+        .unwrap_or_default();
+    e.year = Some(new_year_target(local, offset));
+    e.deadlines = deadlines.clone();
+    e.set_menu(menu_items(&deadlines, e.year.as_ref(), local, offset));
+    if args.menu {
+        e.open_menu();
+    }
     // Make sure the directory the menu reads from exists to be dropped into.
     let _ = config::ensure_dir();
 
@@ -294,14 +318,19 @@ fn main() {
             match e.key(key) {
                 engine::Action::Quit => break 'run,
                 engine::Action::OpenFile(path) => open_phrases(&mut e, &mut watch, &path),
+                engine::Action::Forget(i) => forget_deadline(&mut e, &mut deadlines, i),
+                engine::Action::Add(d) => add_deadline(&mut e, &mut deadlines, d),
                 engine::Action::None => {}
             }
         }
 
         // The picker is rebuilt every time it comes up, so a file dropped into
-        // the config directory while we were running is there to choose.
+        // the config directory while we were running is there to choose -- and
+        // so the countdowns on the deadline rows are counted afresh.
         if e.menu_open && !menu_was_open {
-            e.set_menu(menu_items());
+            let local = time::utc_now() + offset;
+            e.deadlines = deadlines.clone();
+            e.set_menu(menu_items(&deadlines, e.year.as_ref(), local, offset));
         }
         menu_was_open = e.menu_open;
 
@@ -323,7 +352,7 @@ fn main() {
                 offset_at = Instant::now();
                 offset = time::local_offset();
             }
-            e.set_wall(time::Wall::from_local(time::utc_now() + offset));
+            e.set_now(time::utc_now(), offset);
         }
 
         // Stat-ing the phrase file every frame would be sixty syscalls a second
@@ -359,19 +388,114 @@ fn main() {
     tty.restore();
 }
 
-/// The rows of the picker: the three modes, then every phrase file under the
-/// config directory, in name order.
-fn menu_items() -> Vec<engine::MenuItem> {
+/// The rows of the picker, in sections: the modes; the deadlines (the turn of
+/// the year first, then the saved ones soonest first, then the row that adds
+/// one); and every phrase file under the config directory, in name order.
+///
+/// `local` and `offset` are what turn the moments into countdowns: the row
+/// shows how long each one has left, so the picker answers the question
+/// before it is asked.
+fn menu_items(
+    deadlines: &[deadline::Deadline],
+    year: Option<&deadline::Deadline>,
+    local: i64,
+    offset: i64,
+) -> Vec<engine::MenuItem> {
+    use engine::{MenuKind, MenuItem};
+
+    let utc = local - offset;
     let mut items = vec![
-        engine::MenuItem::new("WORDS", engine::MenuKind::Words),
-        engine::MenuItem::new("COUNTER", engine::MenuKind::Counter),
-        engine::MenuItem::new("CLOCK", engine::MenuKind::Clock),
+        MenuItem::new("MODES", MenuKind::Head),
+        MenuItem::new("WORDS", MenuKind::Words),
+        MenuItem::new("COUNTER", MenuKind::Counter),
+        MenuItem::new("CLOCK", MenuKind::Clock),
+        MenuItem::new("DEADLINES", MenuKind::Head),
     ];
-    for path in config::phrase_files() {
-        let label = config::label(&path);
-        items.push(engine::MenuItem::new(label, engine::MenuKind::File(path)));
+
+    // The year is a deadline everyone has, and its row carries the two
+    // answers about it: how much of the year has gone, and how long there is
+    // left.
+    if let Some(_y) = year {
+        let (pct, left) = time::year_stats(local);
+        items.push(MenuItem::new(
+            format!(
+                "END OF YEAR  ·  {pct:.1}% GONE  ·  {}",
+                deadline::short(left)
+            ),
+            MenuKind::Year,
+        ));
+    }
+    for (i, d) in deadlines.iter().enumerate() {
+        items.push(MenuItem::new(
+            format!("{}  ·  {}", d.name, deadline::short(d.at - utc)),
+            MenuKind::Deadline(i),
+        ));
+    }
+    items.push(MenuItem::new("+ ADD A DEADLINE", MenuKind::Add));
+
+    let files = config::phrase_files();
+    if !files.is_empty() {
+        items.push(MenuItem::new("PHRASES", MenuKind::Head));
+        for path in files {
+            let label = config::label(&path);
+            items.push(MenuItem::new(label, MenuKind::File(path)));
+        }
     }
     items
+}
+
+/// The turn of the next year, as a deadline that is always there.
+fn new_year_target(local: i64, offset: i64) -> deadline::Deadline {
+    let w = time::Wall::from_local(local);
+    deadline::Deadline::at("END OF YEAR", w.year + 1, 1, 1, 0, 0, offset)
+}
+
+/// Write the list back. Nothing to write to (no config directory) is not a
+/// failure worth interrupting anyone over: the deadline still works, it is
+/// just not remembered.
+fn store_deadlines(ds: &[deadline::Deadline]) {
+    if let Some(path) = config::deadlines_file() {
+        let _ = deadline::save(&path, ds);
+    }
+}
+
+/// A fresh deadline from the form: keep it, count it, show it.
+fn add_deadline(
+    e: &mut engine::Engine,
+    deadlines: &mut Vec<deadline::Deadline>,
+    d: deadline::Deadline,
+) {
+    deadlines.push(d.clone());
+    deadlines.sort_by_key(|d| d.at);
+    store_deadlines(deadlines);
+    e.deadlines = deadlines.clone();
+    e.set_menu(menu_items(deadlines, e.year.as_ref(), e.local, e.local - e.utc));
+    e.start_deadline(d);
+    e.notice = Some(("SAVED".to_string(), 2.5));
+}
+
+/// Take a deadline off the list and write the file back. If it was the one on
+/// screen the wall clock takes over -- you do not keep watching a countdown
+/// you have just decided you do not care about.
+fn forget_deadline(e: &mut engine::Engine, deadlines: &mut Vec<deadline::Deadline>, i: usize) {
+    if i >= deadlines.len() {
+        return;
+    }
+    let gone = deadlines.remove(i);
+    store_deadlines(deadlines);
+    e.deadlines = deadlines.clone();
+    e.set_menu(menu_items(deadlines, e.year.as_ref(), e.local, e.local - e.utc));
+    let shown = e
+        .target
+        .as_ref()
+        .is_some_and(|t| t.name == gone.name && t.at == gone.at);
+    if shown {
+        e.target = None;
+        if e.mode == engine::Mode::Deadline {
+            e.start_clock();
+        }
+    }
+    e.notice = Some(("DELETED".to_string(), 2.5));
 }
 
 /// Load a phrase file chosen from the menu, put it on screen, and start
