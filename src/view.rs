@@ -3,6 +3,7 @@
 use crate::engine::{Engine, Glyph, MenuKind, Mode, Phase};
 use crate::style::{self, Rgb};
 use crate::term::Out;
+use crate::time::Wall;
 use crate::style::{AMBER, BG, CYAN, DIM, FAINT, FG, GREEN, GLITCH_COLORS, MAGENTA};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,13 +33,26 @@ pub fn draw(e: &mut Engine, o: &mut Out) {
         }
     }
 
-    text_layer(e, o, cols, rows, keep_out);
+    let workspace = matches!(e.mode, Mode::Todo | Mode::Plan);
+    if workspace {
+        let r = workspace_layer(e, o, cols, rows);
+        e.workspace = Some(r);
+    } else {
+        // Leaving a workspace has to take its panel with it: the words only
+        // wipe their own footprint, and the panel is bigger than that.
+        if let Some((x, y, w, h)) = e.workspace.take() {
+            erase_box(o, x, y, w, h);
+        }
+        text_layer(e, o, cols, rows, keep_out);
+    }
     hud_layer(e, o, cols, rows, keep_out);
     // The picker, the form and the help panel share the one overlay slot;
     // only one of them can be up at a time. The form wins over the picker
     // (it is opened from it), and the picker over the help panel.
     if e.form.is_some() {
         e.overlay = Some(form(e, o, cols, rows));
+    } else if e.plan_form.is_some() {
+        e.overlay = Some(plan_form(e, o, cols, rows));
     } else if e.menu_open {
         e.overlay = Some(menu(e, o, cols, rows));
     } else if e.help {
@@ -464,7 +478,7 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
         // A wall clock has no start and no finish, and a deadline has a
         // finish but no start anyone chose -- so both get the moving head
         // rather than a fill that would imply they were heading somewhere.
-        Mode::Clock | Mode::Deadline => {
+        Mode::Clock | Mode::Deadline | Mode::Todo | Mode::Plan => {
             sweep = true;
             0.0
         }
@@ -548,6 +562,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         Mode::Clock => strip_clock(e, o, &mut s, y, cols, a, lbl, val),
         Mode::Deadline => strip_deadline(e, o, &mut s, y, cols, a, lbl, val),
         Mode::Words => strip_words(e, o, &mut s, y, cols, a, lbl, val),
+        Mode::Todo | Mode::Plan => {}
     }
     if e.pin {
         s.value(o, y, "pinned", style::mix(BG, AMBER, a));
@@ -563,6 +578,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         Mode::Timer => format!("{}  {}", e.timer_label(), clock(e.elapsed)),
         Mode::Deadline => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
         Mode::Clock => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
+        Mode::Todo | Mode::Plan => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
         Mode::Words => format!("cycle {:02}  {}", e.cycle, clock(e.elapsed)),
     };
     let rx = cols.saturating_sub(right.chars().count() + 2);
@@ -578,6 +594,12 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
                 }
                 Mode::Clock | Mode::Deadline => {
                     "t mode  m menu  f font  g glitch  b pin  h help  q quit"
+                }
+                Mode::Todo => {
+                    "up/down move  space tick  a add  x delete  c clear  t mode  m menu  q quit"
+                }
+                Mode::Plan => {
+                    "left/right day  a add  e edit  x delete  d today  t mode  m menu  q quit"
                 }
                 Mode::Words => {
                     "w/s speed  space next  f font  r auto  g glitch  m menu  h help  q quit"
@@ -711,6 +733,403 @@ fn clock(secs: f64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
+// -- workspaces: the todo list and the planner ------------------------------
+
+/// The two workspaces paint the whole inside of the bezel rather than the
+/// middle of the screen. They share one rect so the frame that leaves one can
+/// wipe it clean.
+fn workspace_rect(cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+    (1, 1, cols.saturating_sub(2), rows.saturating_sub(2))
+}
+
+fn workspace_layer(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+    let (x, y, w, h) = workspace_rect(cols, rows);
+    let a = e.hud.max(0.5);
+    let edge = style::mix(BG, CYAN, a);
+
+    // Opaque: the panel owns its rect for as long as it is up.
+    for row in 0..h {
+        style::cells(o, x, y + row, w, BG);
+    }
+    let (bx, by, bw, bh) = (x + 1, y, w.saturating_sub(2), h);
+    if bw < 4 || bh < 5 {
+        return (x, y, w, h);
+    }
+    box_border(o, cols, bx, by, bw, bh, edge);
+    match e.mode {
+        Mode::Todo => todo_screen(e, o, cols, bx, by, bw, bh, a),
+        Mode::Plan => plan_screen(e, o, cols, bx, by, bw, bh, a),
+        _ => {}
+    }
+    (x, y, w, h)
+}
+
+fn todo_screen(
+    e: &Engine,
+    o: &mut Out,
+    cols: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    a: f64,
+) {
+    let inner_x = bx + 2;
+    let inner_w = bw.saturating_sub(4);
+    let top = by + 3;
+    let hint_y = by + bh - 2;
+    let list_rows = hint_y.saturating_sub(top).max(1);
+    let a = a.max(0.5);
+    let dimc = style::mix(BG, DIM, a);
+    let itemc = style::mix(BG, FG, a);
+    let selc = style::mix(BG, CYAN, a);
+    let selbg = style::mix(BG, CYAN, a * 0.22);
+    let donec = style::mix(BG, DIM, a);
+    let tickc = style::mix(BG, GREEN, a);
+    let title_c = style::mix(BG, FG, a);
+
+    let open = e.todos.iter().filter(|t| !t.done).count();
+    let title = format!("TODO · {open} OPEN / {} TOTAL", e.todos.len());
+    write_text(
+        o,
+        cols,
+        bx + (bw.saturating_sub(title.chars().count())) / 2,
+        by + 1,
+        &title,
+        title_c,
+    );
+
+    // The inline new-task line takes the last content row while it is open.
+    let input_rows = usize::from(e.todo_input.is_some());
+    let rows = list_rows.saturating_sub(input_rows).max(1);
+
+    if e.todos.is_empty() {
+        write_text(
+            o,
+            cols,
+            inner_x,
+            top,
+            &truncate("NOTHING TO DO · PRESS A TO ADD ONE", inner_w),
+            dimc,
+        );
+    }
+
+    let first = if e.todo_sel >= rows {
+        e.todo_sel + 1 - rows
+    } else {
+        0
+    };
+    for (vi, i) in (first..e.todos.len()).take(rows).enumerate() {
+        let t = &e.todos[i];
+        let ry = top + vi;
+        let sel = i == e.todo_sel;
+        if sel {
+            style::cells(o, bx + 1, ry, bw.saturating_sub(2), selbg);
+        }
+        let mark = if sel { ">" } else { " " };
+        let boxs = if t.done { "[x]" } else { "[ ]" };
+        let text = truncate(&t.text, inner_w.saturating_sub(6));
+        write_text(o, cols, inner_x, ry, mark, if sel { selc } else { dimc });
+        write_text(
+            o,
+            cols,
+            inner_x + 2,
+            ry,
+            boxs,
+            if t.done { tickc } else { selc },
+        );
+        write_text(
+            o,
+            cols,
+            inner_x + 6,
+            ry,
+            &text,
+            if sel {
+                selc
+            } else if t.done {
+                donec
+            } else {
+                itemc
+            },
+        );
+    }
+
+    if let Some(input) = &e.todo_input {
+        let ry = top + rows;
+        if ry < hint_y {
+            let caret = (e.elapsed * 2.0).fract() < 0.55;
+            let shown = truncate(input, inner_w.saturating_sub(10));
+            write_text(o, cols, inner_x, ry, "+ [", selc);
+            write_text(o, cols, inner_x + 3, ry, &shown, itemc);
+            if caret {
+                write_text(o, cols, inner_x + 3 + shown.chars().count(), ry, "▌", selc);
+            }
+            write_text(
+                o,
+                cols,
+                inner_x + 3 + shown.chars().count(),
+                ry,
+                "]",
+                selc,
+            );
+        }
+    }
+
+    let hint = if e.todo_input.is_some() {
+        "type a task   enter save   esc cancel"
+    } else {
+        "up/down move   space tick   a add   x delete   c clear done   t mode   m menu"
+    };
+    write_text(o, cols, bx + 2, hint_y, &truncate(hint, bw.saturating_sub(4)), dimc);
+}
+
+fn plan_screen(
+    e: &Engine,
+    o: &mut Out,
+    cols: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    a: f64,
+) {
+    let inner_x = bx + 2;
+    let inner_w = bw.saturating_sub(4);
+    let top = by + 3;
+    let hint_y = by + bh - 2;
+    let a = a.max(0.5);
+    let dimc = style::mix(BG, DIM, a);
+    let itemc = style::mix(BG, FG, a);
+    let selc = style::mix(BG, CYAN, a);
+    let selbg = style::mix(BG, CYAN, a * 0.22);
+    let title_c = style::mix(BG, FG, a);
+    let bar = style::mix(BG, CYAN, a);
+
+    let day = if e.plan_day == i64::MIN {
+        e.today()
+    } else {
+        e.plan_day
+    };
+    let w = Wall::from_local(day * 86_400);
+    let today = day == e.today();
+    let title = format!(
+        "PLANNER · {} {:04}-{:02}-{:02}{}",
+        weekday(&w),
+        w.year,
+        w.month,
+        w.day,
+        if today { " · TODAY" } else { "" }
+    );
+    write_text(
+        o,
+        cols,
+        bx + (bw.saturating_sub(title.chars().count())) / 2,
+        by + 1,
+        &title,
+        title_c,
+    );
+
+    let indices: Vec<usize> = e
+        .plan
+        .iter()
+        .enumerate()
+        .filter(|(_, ev)| ev.day() == day)
+        .map(|(i, _)| i)
+        .collect();
+
+    // The Gantt layout: a time column, a name column, then the day from 00:00
+    // to 24:00. On a narrow window the name column gives way first, then the
+    // bar shrinks to whatever is left.
+    let time_w = if inner_w >= 30 { 11 } else { 8 };
+    let gap = 2;
+    let name_w = inner_w
+        .saturating_sub(time_w + gap + gap + 6)
+        .min(24);
+    let bar_x = inner_x + time_w + gap + if name_w > 0 { name_w + gap } else { 0 };
+    let right = bx + bw - 2;
+    let bar_w = right.saturating_sub(bar_x);
+
+    // Axis labels every six hours, with the tick at each label's left edge.
+    if bar_w >= 8 {
+        for h in [0usize, 6, 12, 18, 24] {
+            let mut px = bar_x + bar_w * h / 24;
+            if h == 24 {
+                px = px.saturating_sub(2);
+            }
+            write_text(o, cols, px, top, &format!("{h:02}"), dimc);
+        }
+    }
+
+    let events_top = top + 2;
+    let rows = hint_y.saturating_sub(events_top);
+    if rows > 0 && indices.is_empty() {
+        write_text(
+            o,
+            cols,
+            inner_x,
+            events_top,
+            &truncate("NO PLANS FOR THIS DAY · PRESS A TO ADD ONE", inner_w),
+            dimc,
+        );
+    }
+
+    let first = if e.plan_sel >= rows {
+        e.plan_sel + 1 - rows
+    } else {
+        0
+    };
+    for (vi, i) in (first..indices.len()).take(rows).enumerate() {
+        let ev = &e.plan[indices[i]];
+        let ry = events_top + vi;
+        let sel = i == e.plan_sel;
+        if sel {
+            style::cells(o, bx + 1, ry, bw.saturating_sub(2), selbg);
+        }
+        let span = truncate(&ev.span(), time_w);
+        write_text(o, cols, inner_x, ry, &span, if sel { selc } else { dimc });
+        if name_w > 0 {
+            let name = truncate(&ev.name, name_w);
+            write_text(
+                o,
+                cols,
+                inner_x + time_w + gap,
+                ry,
+                &name,
+                if sel { selc } else { itemc },
+            );
+        }
+        if bar_w > 0 {
+            let sx = bar_x + (ev.start as usize * bar_w / 1440).min(bar_w - 1);
+            let ex = bar_x + ev.end as usize * bar_w / 1440;
+            let len = ex
+                .saturating_sub(sx)
+                .max(1)
+                .min(right.saturating_sub(sx));
+            style::cells(o, sx, ry, len, if sel { FG } else { bar });
+        }
+    }
+
+    // A moving marker for the real time, so "now" is visible on the day it is
+    // actually now. It rides over the bars rather than hiding behind them.
+    if today && bar_w > 0 {
+        let now = Wall::from_local(e.local);
+        let mins = (now.hour * 60 + now.min) as usize;
+        let mx = bar_x + (mins * bar_w / 1440).min(bar_w - 1);
+        style::cells(o, mx, top, 1, MAGENTA);
+        for vi in 0..rows.min(indices.len().saturating_sub(first)) {
+            style::cells(o, mx, events_top + vi, 1, MAGENTA);
+        }
+    }
+
+    write_text(
+        o,
+        cols,
+        bx + 2,
+        hint_y,
+        &truncate(
+            "left/right day   up/down select   a add   e edit   x delete   d today   t mode   m menu",
+            bw.saturating_sub(4),
+        ),
+        dimc,
+    );
+}
+
+fn weekday(w: &Wall) -> &'static str {
+    const NAMES: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+    NAMES[w.weekday % 7]
+}
+
+/// Cut a string to `n` characters, marking the cut rather than dropping words
+/// silently.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    if n == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+// -- the add-an-event form --------------------------------------------------
+
+/// The planner's form: a name, a start and an end, one of them being filled
+/// in. Returns the panel rect, so the frame that closes it can wipe it.
+fn plan_form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+    let Some(f) = &e.plan_form else {
+        return (0, 0, 0, 0);
+    };
+    let a = e.hud.max(0.5);
+    let title = if f.edit.is_some() { "EDIT EVENT" } else { "NEW EVENT" };
+    let hint = "type to fill   tab / left right field   enter save   esc cancel";
+
+    let w = (hint.len() + 6).max(title.len() + 6).min(cols.saturating_sub(2));
+    let h = 9.min(rows.saturating_sub(2));
+    let x = (cols.saturating_sub(w)) / 2;
+    let y = (rows.saturating_sub(h)) / 2;
+
+    let edge = style::mix(BG, CYAN, a);
+    let title_c = style::mix(BG, FG, a);
+    let dimc = style::mix(BG, DIM, a);
+    let valc = style::mix(BG, FG, a);
+    let selc = style::mix(BG, CYAN, a);
+    let errc = style::mix(BG, MAGENTA, a);
+
+    for row in 0..h {
+        style::cells(o, x, y + row, w, BG);
+    }
+    box_border(o, cols, x, y, w, h, edge);
+    write_text(
+        o,
+        cols,
+        x + (w.saturating_sub(title.chars().count())) / 2,
+        y + 1,
+        title,
+        title_c,
+    );
+
+    let caret = (e.elapsed * 2.0).fract() < 0.55;
+    let fields: [(&str, &String); 3] = [
+        ("NAME", &f.name),
+        ("START", &f.start),
+        ("END", &f.end),
+    ];
+    for (i, (label, buf)) in fields.iter().enumerate() {
+        let ry = y + 2 + i;
+        let on = i == f.field;
+        write_text(o, cols, x + 3, ry, label, if on { selc } else { dimc });
+        let bx = x + 10;
+        let room = w.saturating_sub(bx - x + 3);
+        let shown: String = if buf.chars().count() > room {
+            let mut v: Vec<char> = buf.chars().collect();
+            v.split_off(v.len() - room).into_iter().collect()
+        } else {
+            buf.to_string()
+        };
+        write_text(o, cols, bx, ry, "[", if on { selc } else { dimc });
+        write_text(o, cols, bx + 1, ry, &shown, valc);
+        write_text(
+            o,
+            cols,
+            bx + 1 + shown.chars().count(),
+            ry,
+            "]",
+            if on { selc } else { dimc },
+        );
+        if on && caret {
+            write_text(o, cols, bx + 1 + shown.chars().count(), ry, "▌", selc);
+        }
+    }
+
+    match &f.err {
+        Some(msg) => write_text(o, cols, x + 2, y + h - 2, msg, errc),
+        None => write_text(o, cols, x + 2, y + h - 2, hint, dimc),
+    }
+    (x, y, w, h)
+}
+
 // -- boot -------------------------------------------------------------------
 
 /// Returns the rect it painted, so the next frame can wipe it.
@@ -763,6 +1182,23 @@ const HELP_TIMER: &[(&str, &str)] = &[
     ("+ / -", "lengthen / shorten the run"),
 ];
 
+const HELP_TODO: &[(&str, &str)] = &[
+    ("UP / DOWN", "move through the list"),
+    ("SPACE", "tick / untick the task"),
+    ("A", "add a task"),
+    ("X", "delete the task"),
+    ("C", "clear every finished task"),
+];
+
+const HELP_PLAN: &[(&str, &str)] = &[
+    ("LEFT / RIGHT", "previous / next day"),
+    ("UP / DOWN", "move through the day"),
+    ("A", "add an event"),
+    ("E", "edit the event"),
+    ("X", "delete the event"),
+    ("D", "jump back to today"),
+];
+
 /// The rows for the panel, in the order they are drawn: whatever is specific to
 /// the current mode first, then the keys that mean the same thing either way.
 fn help_rows(e: &Engine) -> Vec<(&'static str, &'static str)> {
@@ -770,6 +1206,8 @@ fn help_rows(e: &Engine) -> Vec<(&'static str, &'static str)> {
     match e.mode {
         Mode::Timer => v.extend_from_slice(HELP_TIMER),
         Mode::Words => v.extend_from_slice(HELP_WORDS),
+        Mode::Todo => v.extend_from_slice(HELP_TODO),
+        Mode::Plan => v.extend_from_slice(HELP_PLAN),
         // The wall clock and a deadline have no controls of their own: they
         // run because time does.
         Mode::Clock | Mode::Deadline => {}
@@ -1112,4 +1550,119 @@ fn shift(v: isize) -> usize {
 fn ease(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::Event;
+    use crate::term::Out;
+    use crate::todo::Todo;
+
+    /// One frame, as text, so a test can look for what should be on screen.
+    fn frame(e: &mut Engine) -> String {
+        let mut o = Out::new();
+        draw(e, &mut o);
+        String::from_utf8_lossy(&o.0).to_string()
+    }
+
+    #[test]
+    fn the_todo_workspace_draws_its_list_and_boxes() {
+        let mut e = Engine::new(1, 100, 30);
+        e.set_now(0, 0);
+        e.hud = 1.0;
+        e.todos = vec![
+            Todo::new("BUY COFFEE"),
+            Todo {
+                text: "SHIP IT".into(),
+                done: true,
+            },
+        ];
+        e.start_todo();
+
+        let f = frame(&mut e);
+        assert!(f.contains("TODO"), "the panel has a title");
+        assert!(f.contains("1 OPEN / 2 TOTAL"), "and counts the list");
+        assert!(f.contains("BUY COFFEE"), "an open task is drawn");
+        assert!(f.contains("SHIP IT"), "a finished one too");
+        assert!(f.contains("[ ]"), "with an empty box");
+        assert!(f.contains("[x]"), "and a ticked one");
+        assert!(e.workspace.is_some(), "the workspace records its rect");
+    }
+
+    #[test]
+    fn the_todo_workspace_draws_the_new_task_line_while_typing() {
+        let mut e = Engine::new(1, 100, 30);
+        e.hud = 1.0;
+        e.start_todo();
+        e.key(b'a');
+        for c in b"walk the dog" {
+            e.key(*c);
+        }
+
+        let f = frame(&mut e);
+        assert!(f.contains("+ ["), "the inline line is open");
+        assert!(f.contains("walk the dog"), "and shows what was typed");
+        assert!(f.contains("enter save"), "with its own hint");
+    }
+
+    #[test]
+    fn the_planner_draws_a_gantt_row_per_event() {
+        let mut e = Engine::new(1, 120, 30);
+        e.set_now(0, 0); // 1970-01-01
+        e.hud = 1.0;
+        e.plan = vec![
+            Event::new("STANDUP", 1970, 1, 1, 9 * 60, 10 * 60 + 30),
+            Event::new("LUNCH", 1970, 1, 1, 12 * 60 + 30, 13 * 60 + 15),
+        ];
+        e.start_plan();
+
+        let f = frame(&mut e);
+        assert!(f.contains("PLANNER"), "the panel has a title");
+        assert!(f.contains("1970-01-01"), "and names the day");
+        assert!(f.contains("TODAY"), "which is today");
+        assert!(f.contains("STANDUP"), "the first event is drawn");
+        assert!(f.contains("09:00-10:30"), "with its span");
+        assert!(f.contains("LUNCH"), "and so is the second");
+        assert!(f.contains("12:30-13:15"), "with its own span");
+        assert!(f.contains("00") && f.contains("24"), "the day axis is labelled");
+        assert!(e.workspace.is_some(), "the workspace records its rect");
+    }
+
+    #[test]
+    fn the_planner_draws_the_new_event_form() {
+        let mut e = Engine::new(1, 100, 30);
+        e.set_now(0, 0);
+        e.hud = 1.0;
+        e.start_plan();
+        e.key(b'a');
+
+        let f = frame(&mut e);
+        assert!(f.contains("NEW EVENT"), "the form has a title");
+        for label in ["NAME", "START", "END"] {
+            assert!(f.contains(label), "the {label} field is drawn");
+        }
+        assert!(f.contains("enter save"), "and the hint says how to finish");
+    }
+
+    /// The words only wipe their own footprint, so the frame that leaves a
+    /// workspace has to take the whole panel down with it.
+    #[test]
+    fn leaving_a_workspace_wipes_the_panel_it_painted() {
+        let mut e = Engine::new(1, 80, 24);
+        e.hud = 1.0;
+        e.start_todo();
+        let _ = frame(&mut e);
+        let (x, y, w, h) = e.workspace.expect("the todo panel records its rect");
+        assert_eq!((x, y, w, h), (1, 1, 78, 22), "the panel fills the bezel");
+
+        e.start_timer(true, 60.0);
+        let f = frame(&mut e);
+        assert!(e.workspace.is_none(), "the workspace is no longer up");
+        let wipe = format!("\x1b[{};{}H\x1b[48;2;4;7;12m", y + 1, x + 1);
+        assert!(
+            f.contains(&wipe),
+            "the panel's top-left cell is wiped back to the page background"
+        );
+    }
 }

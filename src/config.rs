@@ -69,6 +69,17 @@ pub fn deadlines_file() -> Option<PathBuf> {
     dir().map(|d| d.join("deadlines"))
 }
 
+/// The file the todo list lives in. Not a `.txt` for the same reason as the
+/// deadline file: the phrase picker offers every `.txt` in the directory.
+pub fn todos_file() -> Option<PathBuf> {
+    dir().map(|d| d.join("todos"))
+}
+
+/// The file the day planner lives in.
+pub fn plan_file() -> Option<PathBuf> {
+    dir().map(|d| d.join("plan"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

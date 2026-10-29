@@ -9,9 +9,11 @@ mod deadline;
 mod engine;
 mod font;
 mod phrases;
+mod plan;
 mod style;
 mod term;
 mod time;
+mod todo;
 mod view;
 
 use std::io::{self, IsTerminal, Read};
@@ -62,6 +64,10 @@ struct Args {
     clock: bool,
     /// Open the picker at startup.
     menu: bool,
+    /// Start on the todo list.
+    todo: bool,
+    /// Start on the day planner.
+    plan: bool,
 }
 
 /// `--timer` takes a length in seconds, or `up` / `down` for a stopwatch or the
@@ -88,6 +94,8 @@ fn parse() -> Result<Args, String> {
         timer: None,
         clock: false,
         menu: false,
+        todo: false,
+        plan: false,
     };
     // Peekable so `--timer` can take a value or stand alone, the way `ps` and
     // friends do.
@@ -125,6 +133,8 @@ fn parse() -> Result<Args, String> {
             }
             "-k" | "--clock" => a.clock = true,
             "-m" | "--menu" => a.menu = true,
+            "--todo" => a.todo = true,
+            "--plan" => a.plan = true,
             v if v.starts_with('-') => return Err(format!("unknown flag {v}")),
             v => return Err(format!("unexpected argument {v}")),
         }
@@ -151,17 +161,21 @@ fn usage() {
     -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
     -k, --clock         start on the wall clock
     -m, --menu          open the picker at startup
+        --todo          start on the todo list
+        --plan          start on the day planner
     -l, --list          print the built-in phrases and exit
     -h, --help          this text
 
   MODES
-    There are four things this program can be. `T` walks between them, or
+    There are six things this program can be. `T` walks between them, or
     press `M` for the picker and choose one directly:
 
         WORDS     the typewriter
         COUNTER   a countdown or a stopwatch
         CLOCK     the real time of day and the date
         DEADLINE  how long is left until a saved moment
+        TODO      a little list of things to do
+        PLANNER   a day of blocks with a start and an end
 
   COUNTER
         words --timer          a 25:00 countdown, armed and waiting
@@ -181,6 +195,32 @@ fn usage() {
     (HH:MM), and remembers it in:
 
         {dir}/deadlines
+
+  TODO
+    A little list of things to do, one per line. In the list:
+
+        space     tick / untick the highlighted task
+        a         add a task (type it, enter saves, esc cancels)
+        x         delete the highlighted task
+        c         clear every finished task
+
+    It is remembered in:
+
+        {dir}/todos
+
+  PLANNER
+    A day of named blocks, each with a start and an end, drawn as a small
+    Gantt chart against a 24-hour axis. On a block row:
+
+        left/right or n/p   previous / next day
+        d                   jump back to today
+        a                   add an event (name, start, end)
+        e                   edit the highlighted event
+        x                   delete the highlighted event
+
+    Events are remembered in:
+
+        {dir}/plan
 
   PHRASES
     A words.txt in the working directory is used if --words is not given, and
@@ -216,6 +256,14 @@ fn usage() {
   KEYS (on the clock)
     F  font   G  glitch   B  pin      M   open the menu
     T  next mode   H / ?  controls    Q   quit
+
+  KEYS (on the todo list)
+    up/down move   space tick   a add   x delete   c clear done
+    T  next mode   M  menu   H / ?  controls   Q  quit
+
+  KEYS (on the planner)
+    left/right day   up/down select   a add   e edit   x delete
+    d  today   T  next mode   M  menu   H / ?  controls   Q  quit
 "
     );
 }
@@ -293,7 +341,26 @@ fn main() {
         .unwrap_or_default();
     e.year = Some(new_year_target(local, offset));
     e.deadlines = deadlines.clone();
+
+    // The todo list and the planner are workspaces rather than clocks, so they
+    // are loaded whole and handed to the engine; every edit comes back as an
+    // action and is written straight out.
+    let mut todos = config::todos_file()
+        .map(|p| todo::load(&p))
+        .unwrap_or_default();
+    let mut plan = config::plan_file()
+        .map(|p| plan::load(&p))
+        .unwrap_or_default();
+    e.todos = todos.clone();
+    e.plan = plan.clone();
+
     e.set_menu(menu_items(&deadlines, e.year.as_ref(), local, offset));
+    if args.todo {
+        e.start_todo();
+    }
+    if args.plan {
+        e.start_plan();
+    }
     if args.menu {
         e.open_menu();
     }
@@ -320,6 +387,14 @@ fn main() {
                 engine::Action::OpenFile(path) => open_phrases(&mut e, &mut watch, &path),
                 engine::Action::Forget(i) => forget_deadline(&mut e, &mut deadlines, i),
                 engine::Action::Add(d) => add_deadline(&mut e, &mut deadlines, d),
+                engine::Action::Todos(v) => {
+                    todos = v;
+                    store_todos(&todos);
+                }
+                engine::Action::Plan(v) => {
+                    plan = v;
+                    store_plan(&plan);
+                }
                 engine::Action::None => {}
             }
         }
@@ -409,6 +484,8 @@ fn menu_items(
         MenuItem::new("WORDS", MenuKind::Words),
         MenuItem::new("COUNTER", MenuKind::Counter),
         MenuItem::new("CLOCK", MenuKind::Clock),
+        MenuItem::new("TODO", MenuKind::Todo),
+        MenuItem::new("PLANNER", MenuKind::Plan),
         MenuItem::new("DEADLINES", MenuKind::Head),
     ];
 
@@ -456,6 +533,21 @@ fn new_year_target(local: i64, offset: i64) -> deadline::Deadline {
 fn store_deadlines(ds: &[deadline::Deadline]) {
     if let Some(path) = config::deadlines_file() {
         let _ = deadline::save(&path, ds);
+    }
+}
+
+/// Write the todo list back. Nothing to write to is not a failure worth
+/// interrupting anyone over: the list still works for this session.
+fn store_todos(ts: &[todo::Todo]) {
+    if let Some(path) = config::todos_file() {
+        let _ = todo::save(&path, ts);
+    }
+}
+
+/// Write the planner back.
+fn store_plan(es: &[plan::Event]) {
+    if let Some(path) = config::plan_file() {
+        let _ = plan::save(&path, es);
     }
 }
 
@@ -778,6 +870,8 @@ mod tests {
             timer: None,
             clock: false,
             menu: false,
+            todo: false,
+            plan: false,
         }
     }
 

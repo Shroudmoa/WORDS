@@ -130,6 +130,18 @@ pub fn parse_when(s: &str) -> Option<(i32, u32, u32, u32, u32)> {
     Some((y, m, day, h, min))
 }
 
+/// Parse a bare clock time: `09:30`, or `9:30`. Used by the planner for the
+/// start and end of a block, which carry no date of their own.
+pub fn parse_clock(s: &str) -> Option<(u32, u32)> {
+    let mut t = s.split(':');
+    let h: u32 = t.next()?.trim().parse().ok()?;
+    let min: u32 = t.next()?.trim().parse().ok()?;
+    if t.next().is_some() || h > 23 || min > 59 {
+        return None;
+    }
+    Some((h, min))
+}
+
 /// How much of the calendar year has run, and how long the rest of it is:
 /// `(percent gone, seconds to the turn of the year)`. `local` is seconds
 /// since the epoch in the machine's own time.
@@ -288,6 +300,17 @@ mod tests {
             "",
         ] {
             assert_eq!(parse_when(bad), None, "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn clock_times_parse_and_refuse_the_impossible() {
+        assert_eq!(parse_clock("09:30"), Some((9, 30)));
+        assert_eq!(parse_clock("9:05"), Some((9, 5)));
+        assert_eq!(parse_clock("00:00"), Some((0, 0)));
+        assert_eq!(parse_clock("23:59"), Some((23, 59)));
+        for bad in ["24:00", "12:60", "9", "9:5:1", "", "nine"] {
+            assert_eq!(parse_clock(bad), None, "{bad} should not parse");
         }
     }
 

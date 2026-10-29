@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use crate::deadline::Deadline;
 use crate::font;
 use crate::phrases;
+use crate::plan::Event;
 use crate::style::{self, Rng};
 use crate::time::{self, Wall};
+use crate::todo::Todo;
 
 // -- tuning -----------------------------------------------------------------
 
@@ -87,6 +89,10 @@ pub enum Mode {
     Clock,
     /// How long is left until a saved deadline, driven by the machine.
     Deadline,
+    /// A little todo list, driven by the keys.
+    Todo,
+    /// A day planner: named blocks with a start and an end.
+    Plan,
 }
 
 /// A countdown or a stopwatch.
@@ -136,6 +142,10 @@ pub enum Action {
     /// The form finished a new deadline. The caller saves it and puts it on
     /// screen.
     Add(Deadline),
+    /// The todo list changed. The caller writes the whole list back.
+    Todos(Vec<Todo>),
+    /// The planner changed. The caller writes the whole list back.
+    Plan(Vec<Event>),
 }
 
 /// One selectable row on the menu, and what choosing it does.
@@ -171,6 +181,10 @@ pub enum MenuKind {
     Year,
     /// The row that opens the add-a-deadline form.
     Add,
+    /// The todo list.
+    Todo,
+    /// The day planner.
+    Plan,
     /// Load the phrases out of this file and switch to the words.
     File(PathBuf),
 }
@@ -229,6 +243,87 @@ impl Form {
         match i {
             0 => 20,
             1 => 10,
+            _ => 5,
+        }
+    }
+}
+
+/// The add-an-event form: a name, a start and an end, filled in one at a time.
+///
+/// It is the deadline form's smaller cousin. The date is not asked for: the
+/// planner is already showing the day the event belongs to, so the only
+/// questions left are what it is and when it starts and stops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanForm {
+    /// 0 is the name, 1 the start, 2 the end.
+    pub field: usize,
+    pub name: String,
+    /// `HH:MM`.
+    pub start: String,
+    pub end: String,
+    pub err: Option<String>,
+    /// The times arrive pre-filled with a sensible block. Until a character is
+    /// typed into one of them it holds a placeholder, so the first keystroke
+    /// replaces it instead of landing in a full field.
+    pub fresh: [bool; 2],
+    /// The event being edited, if this form was opened on an existing row.
+    pub edit: Option<usize>,
+}
+
+impl PlanForm {
+    /// A new event on `day`. On today the default block starts at the next
+    /// quarter hour; on any other day it is the familiar 09:00-10:00.
+    pub fn defaults(day: i64, now: i64) -> PlanForm {
+        let w = Wall::from_local(day * 86_400);
+        let today = Wall::from_local(now);
+        let is_today = (w.year, w.month, w.day) == (today.year, today.month, today.day);
+        let start = if is_today {
+            let next = ((today.hour * 60 + today.min) / 15 + 1) * 15;
+            if next > 23 * 60 {
+                9 * 60
+            } else {
+                next
+            }
+        } else {
+            9 * 60
+        };
+        let end = (start + 60).min(23 * 60 + 59);
+        PlanForm {
+            field: 0,
+            name: String::new(),
+            start: Event::hhmm(start),
+            end: Event::hhmm(end),
+            err: None,
+            fresh: [true, true],
+            edit: None,
+        }
+    }
+
+    /// The form opened on an existing event. Everything is real text, so the
+    /// first keystroke appends rather than wiping what is already there.
+    pub fn edit(ev: &Event, index: usize) -> PlanForm {
+        PlanForm {
+            field: 0,
+            name: ev.name.clone(),
+            start: Event::hhmm(ev.start),
+            end: Event::hhmm(ev.end),
+            err: None,
+            fresh: [false, false],
+            edit: Some(index),
+        }
+    }
+
+    fn slot(&mut self, i: usize) -> &mut String {
+        match i {
+            0 => &mut self.name,
+            1 => &mut self.start,
+            _ => &mut self.end,
+        }
+    }
+
+    fn cap(i: usize) -> usize {
+        match i {
+            0 => 24,
             _ => 5,
         }
     }
@@ -350,11 +445,33 @@ pub struct Engine {
     /// The add-a-deadline form, up while it is being filled in.
     pub form: Option<Form>,
 
+    // -- the todo list --------------------------------------------------------
+    /// The saved todo list, handed in from the caller. The engine edits its
+    /// copy and hands the whole thing back as an action when it changes.
+    pub todos: Vec<Todo>,
+    pub todo_sel: usize,
+    /// The inline "new task" line, while it is being typed.
+    pub todo_input: Option<String>,
+
+    // -- the planner ----------------------------------------------------------
+    /// Every saved event, for every day. The planner filters it to the day it
+    /// is showing.
+    pub plan: Vec<Event>,
+    /// The day on screen, as days since the epoch.
+    pub plan_day: i64,
+    /// Selection within the events on `plan_day`, not within `plan`.
+    pub plan_sel: usize,
+    /// The add-an-event form, up while it is being filled in.
+    pub plan_form: Option<PlanForm>,
+
     // -- the menu -------------------------------------------------------------
     /// The picker: modes plus any phrase files found under the config dir.
     pub menu_open: bool,
     pub menu: Vec<MenuItem>,
     pub menu_sel: usize,
+    /// The rect a workspace mode (todo, planner) last painted, so the frame
+    /// that leaves it can wipe the panel rather than leaving it on screen.
+    pub workspace: Option<(usize, usize, usize, usize)>,
 }
 
 impl Engine {
@@ -421,9 +538,17 @@ impl Engine {
             target: None,
             left: 0.0,
             form: None,
+            todos: Vec::new(),
+            todo_sel: 0,
+            todo_input: None,
+            plan: Vec::new(),
+            plan_day: i64::MIN,
+            plan_sel: 0,
+            plan_form: None,
             menu_open: false,
             menu: Vec::new(),
             menu_sel: 0,
+            workspace: None,
         };
         e.next_glitch = e.glitch_soon(GLITCH_AMBIENT.0, GLITCH_AMBIENT.1);
         e.load(0);
@@ -654,10 +779,16 @@ impl Engine {
     }
 
     /// Whether one of the panels -- the picker, the help sheet, the deadline
-    /// form -- is in front of the words. They are the one thing the ambient
-    /// animation must not play through.
+    /// form, the event form -- is in front of the words. They are the one thing
+    /// the ambient animation must not play through. The todo list and the
+    /// planner are workspaces rather than overlays, but they own the middle of
+    /// the screen too, so the glitches stay parked while they are up.
     pub fn overlay_up(&self) -> bool {
-        self.menu_open || self.help || self.form.is_some()
+        self.menu_open
+            || self.help
+            || self.form.is_some()
+            || self.plan_form.is_some()
+            || matches!(self.mode, Mode::Todo | Mode::Plan)
     }
 
     // -- the clock -----------------------------------------------------------
@@ -744,7 +875,7 @@ impl Engine {
                 _ if self.timer.down => "COUNTDOWN".to_string(),
                 _ => "STOPWATCH".to_string(),
             }),
-            Mode::Words => None,
+            Mode::Words | Mode::Todo | Mode::Plan => None,
         }
     }
 
@@ -884,6 +1015,38 @@ impl Engine {
         self.target = Some(t);
         self.flash = 0.0;
         self.load_digits();
+    }
+
+    /// The local day the machine is on, as days since the epoch.
+    pub fn today(&self) -> i64 {
+        let w = Wall::from_local(self.local);
+        time::days_from_civil(w.year, w.month, w.day)
+    }
+
+    /// Start in the todo list. The list keeps its selection; the inline input
+    /// is closed so arriving here is never half-way through a task.
+    pub fn start_todo(&mut self) {
+        if self.mode == Mode::Words {
+            self.words_pixel = self.pixel;
+        }
+        self.mode = Mode::Todo;
+        self.phase = Phase::Running;
+        self.todo_input = None;
+        self.todo_sel = self.todo_sel.min(self.todos.len().saturating_sub(1));
+        self.full = true;
+    }
+
+    /// Start in the planner, on today.
+    pub fn start_plan(&mut self) {
+        if self.mode == Mode::Words {
+            self.words_pixel = self.pixel;
+        }
+        self.mode = Mode::Plan;
+        self.phase = Phase::Running;
+        self.plan_day = self.today();
+        self.plan_sel = 0;
+        self.plan_form = None;
+        self.full = true;
     }
 
     /// Take a fresh reading of the real clock: `utc` seconds since the epoch
@@ -1136,7 +1299,7 @@ impl Engine {
                     // up armed and waiting and the wall clock starts running.
                     self.phase = match self.mode {
                         Mode::Timer => Phase::Ready,
-                        Mode::Clock | Mode::Deadline => Phase::Running,
+                        Mode::Clock | Mode::Deadline | Mode::Todo | Mode::Plan => Phase::Running,
                         Mode::Words => Phase::Typing,
                     };
                     self.full = true;
@@ -1197,7 +1360,7 @@ impl Engine {
             Mode::Timer => self.update_timer(dt),
             Mode::Deadline => self.update_deadline(dt),
             Mode::Clock => self.update_clock(dt),
-            Mode::Words => {}
+            Mode::Words | Mode::Todo | Mode::Plan => {}
         }
     }
 
@@ -1232,10 +1395,20 @@ impl Engine {
         if self.form.is_some() {
             return self.form_key(b);
         }
+        // The event form owns the keyboard the same way the deadline form
+        // does: a stray `W` belongs in the name, not in the mode behind it.
+        if self.plan_form.is_some() {
+            return self.plan_form_key(b);
+        }
         // While the picker is up it owns the keyboard: a stray `W` should move
         // the selection, not the typing speed behind the panel.
         if self.menu_open {
             return self.menu_key(b);
+        }
+        // The inline new-task line is a text field: every printable key is a
+        // character, not a command.
+        if self.todo_input.is_some() {
+            return self.todo_input_key(b);
         }
         match b {
             b'q' | b'Q' | 0x03 | 0x04 => return Action::Quit,
@@ -1251,6 +1424,8 @@ impl Engine {
             b'g' | b'G' => self.kick(),
             b'b' | b'B' => self.pin = !self.pin,
             b'f' | b'F' => self.toggle_font(),
+            _ if self.mode == Mode::Todo => return self.todo_key(b),
+            _ if self.mode == Mode::Plan => return self.plan_key(b),
             _ if self.mode == Mode::Timer => self.timer_key(b),
             _ if self.mode == Mode::Clock || self.mode == Mode::Deadline => {
                 self.clock_key(b)
@@ -1268,19 +1443,24 @@ impl Engine {
             Mode::Timer => "COUNTER",
             Mode::Clock => "CLOCK",
             Mode::Deadline => "DEADLINE",
+            Mode::Todo => "TODO",
+            Mode::Plan => "PLANNER",
         }
     }
 
     /// `T` walks the modes in a ring. The deadline is only worth walking to
     /// when there is one to show -- the picker always offers the turn of the
     /// year, but a bare engine with no deadlines should not dead-end there.
+    /// The todo list and the planner are always there.
     fn cycle_mode(&mut self) {
         let next = match self.mode {
             Mode::Words => Mode::Timer,
             Mode::Timer => Mode::Clock,
             Mode::Clock if self.target.is_some() || self.year.is_some() => Mode::Deadline,
-            Mode::Clock => Mode::Words,
-            Mode::Deadline => Mode::Words,
+            Mode::Clock => Mode::Todo,
+            Mode::Deadline => Mode::Todo,
+            Mode::Todo => Mode::Plan,
+            Mode::Plan => Mode::Words,
         };
         self.set_mode(next);
         self.notice = Some((self.mode_name().to_string(), 2.0));
@@ -1335,6 +1515,8 @@ impl Engine {
                     self.start_deadline(t);
                 }
             }
+            Mode::Todo => self.start_todo(),
+            Mode::Plan => self.start_plan(),
         }
         self.full = true;
         self.idle = 0.0;
@@ -1473,6 +1655,8 @@ impl Engine {
             MenuKind::Words => Mode::Words,
             MenuKind::Counter => Mode::Timer,
             MenuKind::Clock => Mode::Clock,
+            MenuKind::Todo => Mode::Todo,
+            MenuKind::Plan => Mode::Plan,
             MenuKind::File(path) => return Action::OpenFile(path.clone()),
             // Handled above; the match only has to be exhaustive.
             MenuKind::Head | MenuKind::Year | MenuKind::Deadline(_) | MenuKind::Add => {
@@ -1583,6 +1767,11 @@ impl Engine {
     }
 
     fn toggle_font(&mut self) {
+        // A todo list and a planner are text on the terminal's own font; the
+        // big pixel font has nothing to say there.
+        if matches!(self.mode, Mode::Todo | Mode::Plan) {
+            return;
+        }
         self.pixel = !self.pixel;
         if matches!(self.mode, Mode::Timer | Mode::Clock | Mode::Deadline) {
             self.load_digits();
@@ -1644,6 +1833,278 @@ impl Engine {
     /// to it: the font, glitch and pin keys are handled before we get here.
     fn clock_key(&mut self, _b: u8) {}
 
+    // -- the todo list -------------------------------------------------------
+
+    fn todo_move(&mut self, dir: isize) {
+        let n = self.todos.len() as isize;
+        if n == 0 {
+            self.todo_sel = 0;
+            return;
+        }
+        self.todo_sel = (self.todo_sel as isize + dir).rem_euclid(n) as usize;
+    }
+
+    fn todo_toggle(&mut self) -> Action {
+        let Some(t) = self.todos.get_mut(self.todo_sel) else {
+            return Action::None;
+        };
+        t.done = !t.done;
+        Action::Todos(self.todos.clone())
+    }
+
+    fn todo_forget(&mut self) -> Action {
+        if self.todo_sel >= self.todos.len() {
+            return Action::None;
+        }
+        self.todos.remove(self.todo_sel);
+        self.todo_sel = self.todo_sel.min(self.todos.len().saturating_sub(1));
+        Action::Todos(self.todos.clone())
+    }
+
+    fn todo_clear_done(&mut self) -> Action {
+        if !self.todos.iter().any(|t| t.done) {
+            return Action::None;
+        }
+        self.todos.retain(|t| !t.done);
+        self.todo_sel = self.todo_sel.min(self.todos.len().saturating_sub(1));
+        Action::Todos(self.todos.clone())
+    }
+
+    /// Keys that only mean something while the todo list is up.
+    fn todo_key(&mut self, b: u8) -> Action {
+        match b {
+            KEY_UP | b'k' | b'K' => self.todo_move(-1),
+            KEY_DOWN | b'j' | b'J' => self.todo_move(1),
+            b' ' | b'\n' | b'\r' => return self.todo_toggle(),
+            b'a' | b'A' | b'+' => self.todo_input = Some(String::new()),
+            b'x' | b'X' => return self.todo_forget(),
+            b'c' | b'C' => return self.todo_clear_done(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// The inline new-task line: text until `enter`, or nothing until `esc`.
+    fn todo_input_key(&mut self, b: u8) -> Action {
+        match b {
+            0x03 | 0x04 => return Action::Quit,
+            0x1b => self.todo_input = None,
+            b'\n' | b'\r' => {
+                let text = self
+                    .todo_input
+                    .take()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_uppercase();
+                if !text.is_empty() {
+                    self.todos.push(Todo::new(text));
+                    self.todo_sel = self.todos.len() - 1;
+                    return Action::Todos(self.todos.clone());
+                }
+            }
+            0x7f | 0x08 => {
+                if let Some(s) = self.todo_input.as_mut() {
+                    s.pop();
+                }
+            }
+            c if c.is_ascii_graphic() || c == b' ' => {
+                if let Some(s) = self.todo_input.as_mut() {
+                    if s.chars().count() < 80 {
+                        s.push(c as char);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    // -- the planner ---------------------------------------------------------
+
+    fn ensure_plan_day(&mut self) {
+        if self.plan_day == i64::MIN {
+            self.plan_day = self.today();
+        }
+    }
+
+    /// Global indices of the events on the day being shown, in planner order.
+    fn plan_day_indices(&self) -> Vec<usize> {
+        self.plan
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| ev.day() == self.plan_day)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn plan_move_day(&mut self, dir: i64) {
+        self.ensure_plan_day();
+        self.plan_day = self.plan_day.saturating_add(dir);
+        self.plan_sel = 0;
+    }
+
+    fn plan_move_sel(&mut self, dir: isize) {
+        let n = self.plan_day_indices().len() as isize;
+        if n == 0 {
+            self.plan_sel = 0;
+            return;
+        }
+        self.plan_sel = (self.plan_sel as isize + dir).rem_euclid(n) as usize;
+    }
+
+    fn plan_today(&mut self) {
+        self.plan_day = self.today();
+        self.plan_sel = 0;
+    }
+
+    fn plan_forget(&mut self) -> Action {
+        let indices = self.plan_day_indices();
+        let Some(&global) = indices.get(self.plan_sel) else {
+            return Action::None;
+        };
+        self.plan.remove(global);
+        let left = self.plan_day_indices().len();
+        self.plan_sel = self.plan_sel.min(left.saturating_sub(1));
+        Action::Plan(self.plan.clone())
+    }
+
+    fn plan_edit_selected(&mut self) {
+        let indices = self.plan_day_indices();
+        let Some(&global) = indices.get(self.plan_sel) else {
+            return;
+        };
+        self.plan_form = Some(PlanForm::edit(&self.plan[global], global));
+    }
+
+    /// Keys that only mean something while the planner is up.
+    fn plan_key(&mut self, b: u8) -> Action {
+        match b {
+            KEY_LEFT | b'p' | b'P' => self.plan_move_day(-1),
+            KEY_RIGHT | b'n' | b'N' => self.plan_move_day(1),
+            b'd' | b'D' => self.plan_today(),
+            KEY_UP | b'k' | b'K' => self.plan_move_sel(-1),
+            KEY_DOWN | b'j' | b'J' => self.plan_move_sel(1),
+            b'a' | b'A' | b'+' => {
+                self.ensure_plan_day();
+                self.plan_form = Some(PlanForm::defaults(self.plan_day, self.local));
+            }
+            b'e' | b'E' => self.plan_edit_selected(),
+            b'x' | b'X' => return self.plan_forget(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Keys that only mean something while the add-an-event form is up.
+    fn plan_form_key(&mut self, b: u8) -> Action {
+        if self.plan_form.is_none() {
+            return Action::None;
+        }
+        match b {
+            0x03 | 0x04 => return Action::Quit,
+            0x1b => {
+                self.plan_form = None;
+                self.full = true;
+            }
+            b'\n' | b'\r' => return self.plan_form_commit(),
+            b'\t' | KEY_RIGHT => {
+                if let Some(f) = self.plan_form.as_mut() {
+                    f.field = (f.field + 1) % 3;
+                }
+            }
+            KEY_LEFT => {
+                if let Some(f) = self.plan_form.as_mut() {
+                    f.field = (f.field + 2) % 3;
+                }
+            }
+            0x7f | 0x08 => {
+                if let Some(f) = self.plan_form.as_mut() {
+                    f.slot(f.field).pop();
+                    if f.field > 0 {
+                        f.fresh[f.field - 1] = false;
+                    }
+                    f.err = None;
+                }
+            }
+            c if c.is_ascii_graphic() || c == b' ' => {
+                if let Some(f) = self.plan_form.as_mut() {
+                    let ok = f.field == 0 || matches!(c, b':' | b'0'..=b'9');
+                    if ok && f.field > 0 && f.fresh[f.field - 1] {
+                        f.slot(f.field).clear();
+                        f.fresh[f.field - 1] = false;
+                    }
+                    let room = f.slot(f.field).chars().count() < PlanForm::cap(f.field);
+                    if ok && room {
+                        f.slot(f.field).push(c as char);
+                        f.err = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.full = true;
+        Action::None
+    }
+
+    /// Check the form over and hand back a new (or edited) event, or keep it
+    /// up and say what was wrong.
+    fn plan_form_commit(&mut self) -> Action {
+        let Some(f) = self.plan_form.take() else {
+            return Action::None;
+        };
+        let start = match time::parse_clock(f.start.trim()) {
+            Some((h, m)) => h * 60 + m,
+            None => return self.plan_form_error(f, "THAT IS NOT A TIME"),
+        };
+        let end = match time::parse_clock(f.end.trim()) {
+            Some((h, m)) => h * 60 + m,
+            None => return self.plan_form_error(f, "THAT IS NOT A TIME"),
+        };
+        if end <= start {
+            return self.plan_form_error(f, "END MUST BE AFTER START");
+        }
+
+        let mut name: String = f
+            .name
+            .trim()
+            .chars()
+            .filter(|c| *c != '|')
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if name.is_empty() {
+            name = "EVENT".to_string();
+        }
+
+        self.ensure_plan_day();
+        let w = Wall::from_local(self.plan_day * 86_400);
+        let ev = Event::new(name, w.year, w.month, w.day, start, end);
+        match f.edit {
+            Some(i) if i < self.plan.len() => self.plan[i] = ev.clone(),
+            _ => self.plan.push(ev.clone()),
+        }
+        crate::plan::sort(&mut self.plan);
+
+        // Put the selection on the row just saved, wherever sorting moved it.
+        let pos = self
+            .plan
+            .iter()
+            .position(|e| *e == ev)
+            .unwrap_or(self.plan.len().saturating_sub(1));
+        self.plan_sel = self.plan[..pos]
+            .iter()
+            .filter(|e| e.day() == ev.day())
+            .count();
+        Action::Plan(self.plan.clone())
+    }
+
+    /// Put the form back up with a reason, and leave everything else alone.
+    fn plan_form_error(&mut self, mut f: PlanForm, msg: &str) -> Action {
+        f.err = Some(msg.to_string());
+        self.plan_form = Some(f);
+        self.full = true;
+        Action::None
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if cols != self.cols || rows != self.rows {
             self.cols = cols;
@@ -1661,6 +2122,8 @@ impl Engine {
             || self.help
             || self.menu_open
             || self.form.is_some()
+            || self.plan_form.is_some()
+            || self.todo_input.is_some()
             || self.idle < HUD_IDLE
         {
             1.0
@@ -2196,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn t_walks_the_three_modes_and_hands_each_back_the_way_it_was_left() {
+    fn t_walks_the_modes_and_hands_each_back_the_way_it_was_left() {
         let mut e = eng(80, 24);
         e.pixel = false;
         let phrase = e.text.clone();
@@ -2220,6 +2683,13 @@ mod tests {
             Some("THU 1970-01-01 · 0.0% GONE"),
             "the date, and how much of the year that is"
         );
+
+        // The todo list and the planner are workspaces: they do not touch the
+        // words or the counter behind them.
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Todo);
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Plan);
 
         e.key(b't');
         assert_eq!(e.mode, Mode::Words);
@@ -3058,7 +3528,7 @@ mod tests {
     }
 
     #[test]
-    fn t_walks_four_modes_once_there_is_a_deadline_to_walk_to() {
+    fn t_walks_the_ring_once_there_is_a_deadline_to_walk_to() {
         let mut e = eng(80, 24);
         e.set_now(100, 0);
         e.year = Some(due(1000));
@@ -3069,20 +3539,29 @@ mod tests {
         e.key(b't');
         assert_eq!(e.mode, Mode::Clock);
         e.key(b't');
-        assert_eq!(e.mode, Mode::Deadline, "the ring is four long with one to show");
+        assert_eq!(e.mode, Mode::Deadline, "the deadline is in the ring");
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Todo);
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Plan);
         e.key(b't');
         assert_eq!(e.mode, Mode::Words, "and it comes back round");
     }
 
     #[test]
     fn a_deadline_is_only_walked_to_when_there_is_one() {
-        // A bare engine has no year and no deadlines: `T` stays a three-step.
+        // A bare engine has no year and no deadlines: `T` skips the deadline
+        // but still visits the two workspaces.
         let mut e = eng(80, 24);
         e.key(b't');
         e.key(b't');
         assert_eq!(e.mode, Mode::Clock);
         e.key(b't');
-        assert_eq!(e.mode, Mode::Words, "nothing to count down to, so nowhere to stop");
+        assert_eq!(e.mode, Mode::Todo, "nothing to count down to, so no stop there");
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Plan);
+        e.key(b't');
+        assert_eq!(e.mode, Mode::Words);
     }
 
     #[test]
@@ -3308,6 +3787,194 @@ mod tests {
         e.key(b't'); // Clock -> Deadline (the year)
         assert_eq!(e.mode, Mode::Deadline);
         assert_eq!(e.text, "00:00:40", "the reading is current, not from before");
+    }
+
+    // -- the todo list -------------------------------------------------------
+
+    #[test]
+    fn a_task_can_be_typed_ticked_and_deleted() {
+        let mut e = eng(80, 24);
+        e.start_todo();
+        assert_eq!(e.mode, Mode::Todo);
+        assert_eq!(e.phase, Phase::Running);
+
+        e.key(b'a');
+        assert!(e.todo_input.is_some(), "a opens the inline task line");
+        for c in b"buy coffee" {
+            e.key(*c);
+        }
+        let action = e.key(b'\n');
+        match action {
+            Action::Todos(v) => assert_eq!(v[0].text, "BUY COFFEE"),
+            _ => panic!("saving a task should hand the list back"),
+        }
+        assert_eq!(e.todos.len(), 1);
+        assert_eq!(e.todo_sel, 0);
+        assert!(e.todo_input.is_none());
+
+        // Space ticks it off, and the same key puts it back.
+        e.key(b' ');
+        assert!(e.todos[0].done);
+        e.key(b' ');
+        assert!(!e.todos[0].done);
+
+        // x deletes the row under the selection.
+        match e.key(b'x') {
+            Action::Todos(v) => assert!(v.is_empty()),
+            _ => panic!("deleting a task should hand the list back"),
+        }
+        assert!(e.todos.is_empty());
+    }
+
+    #[test]
+    fn clearing_done_tasks_leaves_the_open_ones_alone() {
+        let mut e = eng(80, 24);
+        e.todos = vec![
+            Todo {
+                text: "FINISHED".into(),
+                done: true,
+            },
+            Todo::new("STILL OPEN"),
+            Todo {
+                text: "ALSO FINISHED".into(),
+                done: true,
+            },
+        ];
+        e.start_todo();
+
+        let action = e.key(b'c');
+        match action {
+            Action::Todos(v) => {
+                let text: Vec<&str> = v.iter().map(|t| t.text.as_str()).collect();
+                assert_eq!(text, ["STILL OPEN"]);
+            }
+            _ => panic!("clearing should hand the list back"),
+        }
+        assert_eq!(e.todos.len(), 1);
+    }
+
+    #[test]
+    fn esc_abandons_a_half_typed_task() {
+        let mut e = eng(80, 24);
+        e.start_todo();
+        e.key(b'a');
+        for c in b"nope" {
+            e.key(*c);
+        }
+        e.key(0x1b);
+        assert!(e.todo_input.is_none());
+        assert!(e.todos.is_empty(), "esc saved nothing");
+    }
+
+    // -- the planner ---------------------------------------------------------
+
+    #[test]
+    fn an_event_can_be_added_edited_and_deleted() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0); // 1970-01-01, a Thursday
+        e.start_plan();
+        assert_eq!(e.mode, Mode::Plan);
+        assert_eq!(e.plan_day, 0);
+
+        e.key(b'a');
+        let f = e.plan_form.clone().expect("a opens the event form");
+        assert_eq!(f.field, 0);
+        assert_eq!(f.start, "00:15", "the next quarter hour, from the reading in");
+        assert_eq!(f.end, "01:15");
+
+        for c in b"standup" {
+            e.key(*c);
+        }
+        e.key(b'\t');
+        for c in b"09:00" {
+            e.key(*c);
+        }
+        e.key(b'\t');
+        for c in b"10:30" {
+            e.key(*c);
+        }
+        let action = e.key(b'\n');
+        match action {
+            Action::Plan(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].name, "STANDUP");
+                assert_eq!((v[0].y, v[0].m, v[0].d), (1970, 1, 1));
+                assert_eq!((v[0].start, v[0].end), (9 * 60, 10 * 60 + 30));
+            }
+            _ => panic!("saving an event should hand the plan back"),
+        }
+        assert_eq!(e.plan.len(), 1);
+        assert_eq!(e.plan_sel, 0);
+
+        // Editing it and saving without touching the times keeps one event.
+        e.key(b'e');
+        assert!(e.plan_form.is_some());
+        let action = e.key(b'\n');
+        match action {
+            Action::Plan(v) => assert_eq!(v.len(), 1, "an edit replaces, it does not add"),
+            _ => panic!("editing should hand the plan back"),
+        }
+
+        match e.key(b'x') {
+            Action::Plan(v) => assert!(v.is_empty()),
+            _ => panic!("deleting an event should hand the plan back"),
+        }
+        assert!(e.plan.is_empty());
+    }
+
+    #[test]
+    fn an_event_whose_end_is_not_after_its_start_is_refused() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.start_plan();
+        e.key(b'a');
+        e.key(b'\t');
+        for c in b"10:00" {
+            e.key(*c);
+        }
+        e.key(b'\t');
+        for c in b"09:00" {
+            e.key(*c);
+        }
+        let action = e.key(b'\n');
+        assert!(matches!(action, Action::None));
+        assert!(e.plan.is_empty(), "nothing was saved");
+        let f = e.plan_form.as_ref().expect("the form stays up");
+        assert_eq!(f.err.as_deref(), Some("END MUST BE AFTER START"));
+    }
+
+    #[test]
+    fn the_planner_walks_days_and_only_shows_the_one_it_is_on() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.plan = vec![
+            Event::new("TODAY", 1970, 1, 1, 9 * 60, 10 * 60),
+            Event::new("TOMORROW", 1970, 1, 2, 9 * 60, 10 * 60),
+        ];
+        e.start_plan();
+        assert_eq!(e.plan_day_indices(), vec![0]);
+
+        e.key(b'n');
+        assert_eq!(e.plan_day, 1);
+        assert_eq!(e.plan_day_indices(), vec![1]);
+
+        e.key(b'p');
+        assert_eq!(e.plan_day, 0);
+        e.key(b'n');
+        e.key(b'd');
+        assert_eq!(e.plan_day, 0, "d comes back to today");
+    }
+
+    #[test]
+    fn a_workspace_survives_the_boot_and_does_not_touch_the_words_font() {
+        let mut e = eng(80, 24);
+        e.pixel = false;
+        e.start_plan();
+        run(&mut e, BOOT_TIME + 0.1);
+        assert_eq!(e.mode, Mode::Plan);
+        assert_eq!(e.phase, Phase::Running, "the boot hands over to the planner");
+        assert!(!e.pixel, "the planner never switches the words to the big font");
+        assert!(e.overlay_up(), "ambient glitches stay parked under a workspace");
     }
 }
 

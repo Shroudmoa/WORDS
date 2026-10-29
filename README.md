@@ -4,8 +4,9 @@ A classy cyberpunk terminal typewriter. It writes words and sentences in a big
 pixel font in the middle of the screen, blinks a block cursor at the end, holds
 them for a beat, then moves on — with glitch bursts tearing through the text.
 
-It is also a countdown/stopwatch, a wall clock, and a deadline tracker. `T`
-walks between the modes, or open the picker and choose one directly.
+It is also a countdown/stopwatch, a wall clock, a deadline tracker, a little
+todo list, and a day planner drawn as a small Gantt chart. `T` walks between
+the modes, or open the picker and choose one directly.
 
 Zero dependencies. It is raw ANSI escape codes and a 5×7 bitmap font, so it
 builds in seconds and runs anywhere with a terminal.
@@ -38,6 +39,8 @@ POSIX-only — Linux, macOS, and the BSDs. Nothing else is needed.
 -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
 -k, --clock         start on the wall clock
 -m, --menu          open the picker at startup
+    --todo          start on the todo list
+    --plan          start on the day planner
 -l, --list          print the built-in phrases and exit
 -h, --help          usage
 ```
@@ -52,8 +55,8 @@ than replace.
 Anything dropped in `$XDG_CONFIG_HOME/words` (or `~/.config/words`) — every
 `.txt` file there, by its name — shows up on the picker, so prose can be kept
 handy without naming it on the command line. Saved deadlines share the
-directory in a file called `deadlines`; not being a `.txt`, it stays off the
-phrase list.
+directory in a file called `deadlines`; the todo list and the planner use
+`todos` and `plan`. None of them are `.txt`, so they stay off the phrase list.
 
 ## Modes
 
@@ -63,6 +66,8 @@ phrase list.
 | `COUNTER` | a countdown or a stopwatch, driven by the keys |
 | `CLOCK` | the real time of day and the date, driven by the machine |
 | `DEADLINE` | a countdown to a moment you named, or to the end of the year |
+| `TODO` | a little list of things to do |
+| `PLANNER` | a day of blocks with a start and an end |
 
 `--timer` and `--clock` start straight into the one you asked for; without them
 the typewriter is what you get. On the `CLOCK` the date sits under the digits
@@ -97,6 +102,57 @@ GONE`), so the two answers about the year are always a glance away.
 To remove a deadline, highlight it in the picker and press `X`. It is taken off
 the list and the file is written back. (`X` on any other row does nothing — it
 will not delete a phrase file.)
+
+## Todo
+
+`--todo`, the picker, or `T` gets you to a small todo list. It is one task per
+line with a checkbox:
+
+- `UP`/`DOWN` (or `J`/`K`) move through the list.
+- `SPACE` ticks or unticks the highlighted task.
+- `A` opens an inline line at the bottom; type the task, `ENTER` saves it,
+  `ESC` abandons it.
+- `X` deletes the highlighted task.
+- `C` clears every finished task and leaves the open ones alone.
+
+It is saved in `~/.config/words/todos` as plain text, so it can be edited by
+hand:
+
+```
+# [ ] open   [x] done
+[ ] BUY COFFEE
+[x] SHIP IT
+```
+
+A plain `- ` bullet is read as an open task too, and any line that is not a
+task is skipped rather than refusing the rest.
+
+## Planner
+
+`--plan`, the picker, or `T` opens a day planner. Events have a name, a date, a
+start and an end, and the day is drawn as a small Gantt chart: one row per
+event, with the 24-hour day running left to right and each event a bar from its
+start to its end. A magenta marker shows where "now" is when the day on screen
+is today.
+
+- `LEFT`/`RIGHT` (or `P`/`N`) move to the previous or next day.
+- `UP`/`DOWN` (or `K`/`J`) move through the day's events.
+- `A` opens a form for a new event: name, start (`HH:MM`), end (`HH:MM`).
+  `TAB` (or `←`/`→`) moves between fields, `ENTER` saves, `ESC` cancels.
+- `E` edits the highlighted event.
+- `X` deletes the highlighted event.
+- `D` jumps back to today.
+
+An end at or before the start is refused, because an event is a block inside
+one day. Events are saved in `~/.config/words/plan`, one per line:
+
+```
+# name | local date start end
+DESIGN REVIEW | 2026-10-29 09:00 10:30
+LUNCH | 2026-10-29 12:30 13:15
+```
+
+The planner sorts by day and start time, and only draws the day it is showing.
 
 ## Keys
 
@@ -163,6 +219,8 @@ src/style.rs    palette, colour mixing, run-coalescing canvas
 src/font.rs     5x7 glyphs
 src/phrases.rs  phrase pools and transliteration
 src/deadline.rs saved deadlines and the on-disk format
+src/todo.rs     saved todo list and the on-disk format
+src/plan.rs     saved planner events and the on-disk format
 src/time.rs     UTC offset, civil-date maths, the clock's strings
 src/config.rs   the ~/.config/words directory the picker reads
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
@@ -178,7 +236,9 @@ Unit tests cover centring, wrapping, the speed model, the three-second rule,
 the phrase transliteration, and the repaint bookkeeping that keeps stale pixels
 off the screen — alongside the counter, the wall clock's date arithmetic, the
 deadline file's round-trip, the year maths, and the picker's navigation and
-file selection.
+file selection. The todo list and the planner get the same treatment: their
+file formats round-trip, bad lines are skipped, tasks tick and clear, events
+add, edit, delete, sort, and refuse an end before their start.
 
 ## Notes
 
