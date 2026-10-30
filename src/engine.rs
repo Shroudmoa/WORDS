@@ -1246,7 +1246,14 @@ impl Engine {
             self.level = (self.level + dt * 26.0) % 100.0;
         }
         self.idle += dt;
-        self.elapsed += dt;
+        // The workspaces are places to think, not to watch a clock. The session
+        // clock stops while they are up, so the frame is completely still --
+        // otherwise the session readout in the chrome ticks over every second
+        // and makes the whole panel look like it is glitching. Animation time
+        // resumes where it left off on the way out.
+        if !matches!(self.mode, Mode::Todo | Mode::Plan) {
+            self.elapsed += dt;
+        }
 
         // The word fading in / out.
         self.vis += (self.vis_target - self.vis) * (dt * 3.4).min(1.0);
@@ -3864,6 +3871,33 @@ mod tests {
         e.key(0x1b);
         assert!(e.todo_input.is_none());
         assert!(e.todos.is_empty(), "esc saved nothing");
+    }
+
+    /// A workspace is a still place. Its frame must not tick once a second,
+    /// and the countdown behind it must not run on while it is up.
+    #[test]
+    fn a_workspace_parks_the_session_clock_and_the_countdown() {
+        let mut e = eng(80, 24);
+        e.start_timer(true, 60.0);
+        e.key(b' ');
+        run(&mut e, 1.0);
+        let session = e.elapsed;
+        let left = e.timer.value;
+
+        e.start_todo();
+        run(&mut e, 5.0);
+        assert_eq!(e.elapsed, session, "the session clock stops in the todo list");
+        assert_eq!(e.timer.value, left, "and the countdown does not run on");
+
+        e.key(b't'); // Todo -> Plan
+        run(&mut e, 2.0);
+        assert_eq!(e.elapsed, session, "the planner parks it too");
+        assert_eq!(e.timer.value, left);
+
+        e.key(b't'); // Plan -> Words
+        run(&mut e, 1.0);
+        assert!(e.elapsed > session, "and it picks up on the way out");
+        assert_eq!(e.timer.value, left, "the countdown stayed where it was");
     }
 
     // -- the planner ---------------------------------------------------------

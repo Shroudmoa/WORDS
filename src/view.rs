@@ -857,7 +857,9 @@ fn todo_screen(
     if let Some(input) = &e.todo_input {
         let ry = top + rows;
         if ry < hint_y {
-            let caret = (e.elapsed * 2.0).fract() < 0.55;
+            // The session clock is parked in a workspace, so the caret blinks
+            // on the idle clock instead.
+            let caret = (e.idle * 2.0).fract() < 0.55;
             let shown = truncate(input, inner_w.saturating_sub(10));
             write_text(o, cols, inner_x, ry, "+ [", selc);
             write_text(o, cols, inner_x + 3, ry, &shown, itemc);
@@ -1090,7 +1092,9 @@ fn plan_form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize
         title_c,
     );
 
-    let caret = (e.elapsed * 2.0).fract() < 0.55;
+    // The session clock is parked in a workspace, so the caret blinks on the
+    // idle clock instead.
+    let caret = (e.idle * 2.0).fract() < 0.55;
     let fields: [(&str, &String); 3] = [
         ("NAME", &f.name),
         ("START", &f.start),
@@ -1436,8 +1440,9 @@ fn form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     );
 
     // A caret that blinks at a speed a person can follow, rather than the
-    // screen's own sixty-a-second.
-    let caret = (e.elapsed * 2.0).fract() < 0.55;
+    // screen's own sixty-a-second. It rides the idle clock, which keeps running
+    // even when a workspace has parked the session clock.
+    let caret = (e.idle * 2.0).fract() < 0.55;
     let fields: [(&str, &String); 3] = [
         ("NAME", &f.name),
         ("DATE", &f.date),
@@ -1643,6 +1648,23 @@ mod tests {
             assert!(f.contains(label), "the {label} field is drawn");
         }
         assert!(f.contains("enter save"), "and the hint says how to finish");
+    }
+
+    /// The session readout used to tick once a second while a workspace was up,
+    /// which read as the whole panel glitching. A workspace frame should be
+    /// identical from one second to the next.
+    #[test]
+    fn a_workspace_frame_does_not_change_with_the_clock() {
+        let mut e = Engine::new(1, 100, 30);
+        e.set_now(0, 0);
+        e.hud = 1.0;
+        e.todos = vec![Todo::new("BUY COFFEE")];
+        e.start_todo();
+
+        let first = frame(&mut e);
+        e.update(1.0);
+        let second = frame(&mut e);
+        assert_eq!(first, second, "nothing on the todo screen ticks over");
     }
 
     /// The words only wipe their own footprint, so the frame that leaves a
