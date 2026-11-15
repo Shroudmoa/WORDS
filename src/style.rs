@@ -13,10 +13,114 @@ pub const CYAN: Rgb = [0x00, 0xe5, 0xff];
 pub const MAGENTA: Rgb = [0xff, 0x2e, 0x97];
 pub const GREEN: Rgb = [0x2d, 0xff, 0x9c];
 pub const AMBER: Rgb = [0xff, 0xb3, 0x3a];
-pub const DIM: Rgb = [0x18, 0x2c, 0x38];
-pub const FAINT: Rgb = [0x0b, 0x14, 0x1c];
 
-pub const GLITCH_COLORS: [Rgb; 4] = [MAGENTA, CYAN, FG, GREEN];
+/// The three looks the program ships with. A palette is derived from one of
+/// these and then optionally overlaid with the user's own colours.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    #[default]
+    Cyberpunk,
+    Amber,
+    Matrix,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::Cyberpunk, Theme::Amber, Theme::Matrix];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Theme::Cyberpunk => "CYBERPUNK",
+            Theme::Amber => "AMBER",
+            Theme::Matrix => "MATRIX GREEN",
+        }
+    }
+
+    /// The value written in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Theme::Cyberpunk => "cyberpunk",
+            Theme::Amber => "amber",
+            Theme::Matrix => "matrix",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Theme> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-', '_'], "")
+            .as_str()
+        {
+            "cyberpunk" | "cyan" | "default" => Some(Theme::Cyberpunk),
+            "amber" | "orange" => Some(Theme::Amber),
+            "matrix" | "matrixgreen" | "green" => Some(Theme::Matrix),
+            _ => None,
+        }
+    }
+
+    pub fn palette(self) -> Palette {
+        match self {
+            Theme::Cyberpunk => Palette::new(BG, FG, CYAN, MAGENTA, AMBER, GREEN),
+            Theme::Amber => Palette::new(
+                [0x0d, 0x08, 0x03],
+                [0xff, 0xdf, 0xa8],
+                [0xff, 0xb0, 0x00],
+                [0xff, 0x77, 0x1a],
+                [0xff, 0x4d, 0x2e],
+                [0xff, 0xd1, 0x66],
+            ),
+            Theme::Matrix => Palette::new(
+                [0x01, 0x07, 0x03],
+                [0xc8, 0xff, 0xd0],
+                [0x00, 0xff, 0x70],
+                [0x00, 0xb3, 0x4a],
+                [0xc8, 0xff, 0x3a],
+                [0x7d, 0xff, 0xa0],
+            ),
+        }
+    }
+}
+
+/// Every colour the interface paints with. `dim` and `faint` are derived so a
+/// custom background or accent carries through the chrome and control bar too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Palette {
+    pub bg: Rgb,
+    pub fg: Rgb,
+    pub accent: Rgb,
+    pub secondary: Rgb,
+    pub alert: Rgb,
+    pub success: Rgb,
+    pub dim: Rgb,
+    pub faint: Rgb,
+    pub glitch: [Rgb; 4],
+}
+
+impl Palette {
+    pub fn new(bg: Rgb, fg: Rgb, accent: Rgb, secondary: Rgb, alert: Rgb, success: Rgb) -> Palette {
+        let p = Palette {
+            bg,
+            fg,
+            accent,
+            secondary,
+            alert,
+            success,
+            dim: bg,
+            faint: bg,
+            glitch: [secondary, accent, fg, success],
+        };
+        p.finish()
+    }
+
+    /// Recompute the colours that are derived from the main roles. Called after
+    /// a custom colour is applied, so the whole interface moves together.
+    pub fn finish(mut self) -> Palette {
+        self.dim = mix(self.bg, self.accent, 0.13);
+        self.faint = mix(self.bg, self.dim, 0.45);
+        self.glitch = [self.secondary, self.accent, self.fg, self.success];
+        self
+    }
+}
 
 // -- colour math ------------------------------------------------------------
 
@@ -83,27 +187,46 @@ impl Rng {
 /// Wraps a pixel font in vertical cell rows. Because the pixel font is 7 rows
 /// tall and terminal cells are ~2:1, each font row becomes 2 cell rows and the
 /// glyph looks exactly as tall as it was designed.
+///
+/// Horizontal scaling is independent: `x_scale` repeats each source column,
+/// so the glyph gets wider without changing its height.
 pub struct Canvas {
-    pub rows: Vec<[bool; font::COLS]>,
+    pub rows: Vec<Vec<bool>>,
     pub w: usize,
 }
 
 impl Canvas {
-    /// Lay a glyph out into `cell_h` cell rows.
+    /// Lay a glyph out at its original width. Kept for callers that want the
+    /// unstretched bitmap; the screen uses [`Canvas::from_font_scaled`].
+    #[allow(dead_code)]
     pub fn from_font(f: &Font, cell_h: usize) -> Canvas {
-        let mut rows = vec![[false; font::COLS]; font::ROWS * cell_h];
+        Canvas::from_font_scaled(f, cell_h, 1)
+    }
+
+    /// Lay a glyph out into `cell_h` cell rows and `x_scale` cells per source
+    /// column.
+    pub fn from_font_scaled(f: &Font, cell_h: usize, x_scale: usize) -> Canvas {
+        let x_scale = x_scale.max(1);
+        let w = font::COLS * x_scale;
+        let mut rows = vec![vec![false; w]; font::ROWS * cell_h];
         for (fy, bits) in f.iter().enumerate() {
             for sub in 0..cell_h {
                 let ry = fy * cell_h + sub;
                 if ry >= rows.len() {
                     break;
                 }
-                for (fx, cell) in rows[ry].iter_mut().enumerate() {
-                    *cell = (bits >> (font::COLS - 1 - fx)) & 1 == 1;
+                for fx in 0..font::COLS {
+                    let on = (bits >> (font::COLS - 1 - fx)) & 1 == 1;
+                    if !on {
+                        continue;
+                    }
+                    for dx in 0..x_scale {
+                        rows[ry][fx * x_scale + dx] = true;
+                    }
                 }
             }
         }
-        Canvas { rows, w: font::COLS }
+        Canvas { rows, w }
     }
 
     /// Push the canvas into the frame buffer.

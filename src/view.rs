@@ -1,10 +1,9 @@
 //! Drawing. One frame = one string of escape codes, flushed in a single write.
 
-use crate::engine::{Engine, Glyph, MenuKind, Mode, Phase};
+use crate::engine::{Engine, Glyph, MenuKind, MenuPage, Mode, Phase};
 use crate::style::{self, Rgb};
 use crate::term::Out;
 use crate::time::Wall;
-use crate::style::{AMBER, BG, CYAN, DIM, FAINT, FG, GREEN, GLITCH_COLORS, MAGENTA};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -29,7 +28,8 @@ pub fn draw(e: &mut Engine, o: &mut Out) {
     let keep_out = overlay_rect(e, cols, rows);
     if keep_out.is_none() {
         if let Some((x, y, w, h)) = e.overlay.take() {
-            erase_box(o, x, y, w, h);
+            let bg = e.palette.bg;
+            erase_box(o, x, y, w, h, bg);
         }
     }
 
@@ -41,18 +41,21 @@ pub fn draw(e: &mut Engine, o: &mut Out) {
         // Leaving a workspace has to take its panel with it: the words only
         // wipe their own footprint, and the panel is bigger than that.
         if let Some((x, y, w, h)) = e.workspace.take() {
-            erase_box(o, x, y, w, h);
+            let bg = e.palette.bg;
+            erase_box(o, x, y, w, h, bg);
         }
         text_layer(e, o, cols, rows, keep_out);
     }
     hud_layer(e, o, cols, rows, keep_out);
-    // The picker, the form and the help panel share the one overlay slot;
-    // only one of them can be up at a time. The form wins over the picker
-    // (it is opened from it), and the picker over the help panel.
+    // The menu, the forms and the help panel share the one overlay slot;
+    // only one of them can be up at a time. A form wins over the menu (it
+    // is opened from it), and the menu over the help panel.
     if e.form.is_some() {
         e.overlay = Some(form(e, o, cols, rows));
     } else if e.plan_form.is_some() {
         e.overlay = Some(plan_form(e, o, cols, rows));
+    } else if e.color_form.is_some() {
+        e.overlay = Some(color_form(e, o, cols, rows));
     } else if e.menu_open {
         e.overlay = Some(menu(e, o, cols, rows));
     } else if e.help {
@@ -98,8 +101,9 @@ pub fn chrome(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         return;
     }
     let a = 0.30 + 0.70 * e.hud;
-    let rule = style::mix(BG, FAINT, a);
-    let dim = style::mix(BG, DIM, a);
+    let p = e.palette;
+    let rule = style::mix(p.bg, p.faint, a);
+    let dim = style::mix(p.bg, p.dim, a);
 
     // top rule
     style::cells(o, 1, 0, cols - 2, rule);
@@ -115,9 +119,14 @@ pub fn chrome(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     write_text(o, cols, cols - 1, 0, "·", dim);
 
     let name = format!(" words {VERSION} ");
-    write_text(o, cols, 3, 0, &name, style::mix(BG, CYAN, a * 0.9));
+    write_text(o, cols, 3, 0, &name, style::mix(p.bg, p.accent, a * 0.9));
     let s = e.elapsed as u64;
-    let tag = format!(" session {:02}:{:02}:{:02} ", s / 3600, (s / 60) % 60, s % 60);
+    let tag = format!(
+        " session {:02}:{:02}:{:02} ",
+        s / 3600,
+        (s / 60) % 60,
+        s % 60
+    );
     write_text(o, cols, cols.saturating_sub(tag.len() + 2), 0, &tag, dim);
 }
 
@@ -163,7 +172,8 @@ fn text_layer(
             let w = (w + BLEED * 2).min(cols.saturating_sub(x0p));
             let h = (h + BLEED * 2).min(rows.saturating_sub(y0p));
             if w > 0 && h > 0 {
-                erase_box(o, x0p, y0p, w, h);
+                let bg = e.palette.bg;
+                erase_box(o, x0p, y0p, w, h, bg);
             }
         }
         for g in &mut e.glyphs {
@@ -191,12 +201,13 @@ fn text_layer(
         .collect();
 
     let vis = ease(e.vis);
-    let mut base = style::mix(BG, FG, vis);
+    let p = e.palette;
+    let mut base = style::mix(p.bg, p.fg, vis);
     if alarming {
         base = if (e.elapsed * 5.0).fract() < 0.5 {
-            AMBER
+            p.alert
         } else {
-            MAGENTA
+            p.secondary
         };
     }
     let visible = e.typed.min(e.glyphs.len());
@@ -235,18 +246,18 @@ fn text_layer(
             let y = shift(y0 as isize + (row * row_h) as isize + dy);
 
             let color = if turbulent && e.rand.chance(0.25) {
-                GLITCH_COLORS[e.rand.below(GLITCH_COLORS.len())]
+                p.glitch[e.rand.below(p.glitch.len())]
             } else if fading && i == lit {
-                style::mix(base, CYAN, e.flash)
+                style::mix(base, p.accent, e.flash)
             } else {
                 base
             };
 
             if ghost {
-                // Chromatic split: a magenta ghost a couple of cells away.
-                let gi = e.rand.below(GLITCH_COLORS.len());
+                // Chromatic split: a ghost a couple of cells away.
+                let gi = e.rand.below(p.glitch.len());
                 let (gx, gy) = (shift(x as isize + 2), shift(y as isize - 1));
-                paint(&e.glyphs[i], o, cols, gx, gy, GLITCH_COLORS[gi]);
+                paint(&e.glyphs[i], o, cols, gx, gy, p.glitch[gi]);
             }
             paint(&e.glyphs[i], o, cols, x, y, color);
             e.glyphs[i].at = Some((x, y));
@@ -261,7 +272,14 @@ fn text_layer(
         let lx = x0 + bw.saturating_sub(t.chars().count()) / 2;
         let ly = y0 + gh;
         if ly < rows && !masked(keep_out, ly) {
-            write_text(o, cols, lx, ly, t, style::mix(BG, CYAN, ease(e.vis)));
+            write_text(
+                o,
+                cols,
+                lx,
+                ly,
+                t,
+                style::mix(e.palette.bg, e.palette.accent, ease(e.vis)),
+            );
         }
     }
 
@@ -297,7 +315,8 @@ const NOISE: &[char] = &[
 fn noise(e: &mut Engine, o: &mut Out, x0: usize, y0: usize, bw: usize, bh: usize) {
     let n = 3 + e.rand.below(9);
     for _ in 0..n {
-        let c = GLITCH_COLORS[e.rand.below(GLITCH_COLORS.len())];
+        let p = e.palette;
+        let c = p.glitch[e.rand.below(p.glitch.len())];
         let x = x0 + e.rand.below(bw.max(1));
         let y = y0 + e.rand.below(bh.max(1));
         if e.pixel {
@@ -368,13 +387,21 @@ fn retire_cursor(
             None => false,
         };
         if !covered {
-            style::cells(o, cx, y, 1, BG);
+            style::cells(o, cx, y, 1, e.palette.bg);
         }
     }
 }
 
 /// The blinking block cursor, sitting just past the last glyph typed.
-fn cursor(e: &mut Engine, o: &mut Out, x0: usize, y0: usize, row_h: usize, cols: usize, rows: usize) {
+fn cursor(
+    e: &mut Engine,
+    o: &mut Out,
+    x0: usize,
+    y0: usize,
+    row_h: usize,
+    cols: usize,
+    rows: usize,
+) {
     let (col, row) = match e.typed.checked_sub(1).map(|i| &e.glyphs[i]) {
         Some(g) => (g.col + g.w, g.row),
         None => (0, 0),
@@ -394,10 +421,11 @@ fn cursor(e: &mut Engine, o: &mut Out, x0: usize, y0: usize, row_h: usize, cols:
     if row_h == 1 {
         // The terminal font has exactly one row to work with, so the cursor is a
         // solid block character rather than a two-cell stack.
+        let p = e.palette;
         let c = if e.vis > 0.6 {
-            CYAN
+            p.accent
         } else {
-            style::mix(BG, CYAN, e.vis)
+            style::mix(p.bg, p.accent, e.vis)
         };
         write_char(o, cols, x, y, '█', c);
         e.cursor_at = Some((x, y, 1));
@@ -409,8 +437,9 @@ fn cursor(e: &mut Engine, o: &mut Out, x0: usize, y0: usize, row_h: usize, cols:
     if y + h > rows {
         return;
     }
-    style::cells(o, x, y, 1, CYAN);
-    style::cells(o, x, y + h - 1, 1, FG);
+    let p = e.palette;
+    style::cells(o, x, y, 1, p.accent);
+    style::cells(o, x, y + h - 1, 1, p.fg);
     e.cursor_at = Some((x, y, h));
 }
 
@@ -423,10 +452,15 @@ fn cursor(e: &mut Engine, o: &mut Out, x0: usize, y0: usize, row_h: usize, cols:
 /// simply stops drawing strands its pixels until something else happens to
 /// cover them. The bar also *moves* -- the phrase changes, the window resizes --
 /// so we always wipe where we were, not where we are about to be.
-fn erase_hud(o: &mut Out, cols: usize, bar_row: usize, rows: usize) {
-    for r in [bar_row, bar_row + 1, rows.saturating_sub(2), rows.saturating_sub(1)] {
+fn erase_hud(o: &mut Out, cols: usize, bar_row: usize, rows: usize, bg: Rgb) {
+    for r in [
+        bar_row,
+        bar_row + 1,
+        rows.saturating_sub(2),
+        rows.saturating_sub(1),
+    ] {
         if r < rows {
-            style::cells(o, 0, r, cols, BG);
+            style::cells(o, 0, r, cols, bg);
         }
     }
 }
@@ -441,7 +475,8 @@ fn hud_layer(
     keep_out: Option<(usize, usize, usize, usize)>,
 ) {
     if let Some((y, r)) = e.hud_block.take() {
-        erase_hud(o, cols, y, r.min(rows));
+        let bg = e.palette.bg;
+        erase_hud(o, cols, y, r.min(rows), bg);
     }
     // A panel holds the strip still too: it is another thing that would be
     // repainted under the panel and then painted over, and the clock in it only
@@ -486,11 +521,12 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
         Mode::Words => e.typed as f64 / e.glyphs.len() as f64,
     };
 
-    let cap = style::mix(BG, DIM, a);
-    let track = style::mix(BG, FAINT, a);
-    let fill_c = style::mix(BG, CYAN, a);
-    let head = style::mix(BG, FG, a);
-    let tick = style::mix(BG, DIM, a);
+    let p = e.palette;
+    let cap = style::mix(p.bg, p.dim, a);
+    let track = style::mix(p.bg, p.faint, a);
+    let fill_c = style::mix(p.bg, p.accent, a);
+    let head = style::mix(p.bg, p.fg, a);
+    let tick = style::mix(p.bg, p.dim, a);
 
     style::cells(o, x - 2, y, 1, cap);
     style::cells(o, x - 1, y, 1, track);
@@ -547,14 +583,15 @@ impl Strip {
 fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     let a = e.hud;
     let y = rows - 1;
+    let p = e.palette;
     // Wipe the strip before redrawing: field widths change as the numbers
     // change, and a bare cursor move would leave the old digits behind.
-    style::cells(o, 0, y, cols, BG);
-    style::cells(o, 0, rows - 2, cols, style::mix(BG, DIM, a * 0.8));
+    style::cells(o, 0, y, cols, p.bg);
+    style::cells(o, 0, rows - 2, cols, style::mix(p.bg, p.dim, a * 0.8));
 
-    let lbl = style::mix(BG, DIM, a);
-    let val = style::mix(BG, FG, a);
-    let key = style::mix(BG, FAINT, a.max(0.3));
+    let lbl = style::mix(p.bg, p.dim, a);
+    let val = style::mix(p.bg, p.fg, a);
+    let key = style::mix(p.bg, p.faint, a.max(0.3));
 
     let mut s = Strip { x: 2, cols };
     match e.mode {
@@ -565,11 +602,11 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         Mode::Todo | Mode::Plan => {}
     }
     if e.pin {
-        s.value(o, y, "pinned", style::mix(BG, AMBER, a));
+        s.value(o, y, "pinned", style::mix(p.bg, p.alert, a));
     }
     if let Some((msg, left)) = &e.notice {
         let fade = (left / 0.6).clamp(0.0, 1.0);
-        s.value(o, y, msg, style::mix(BG, GREEN, a * fade));
+        s.value(o, y, msg, style::mix(p.bg, p.success, a * fade));
     }
 
     // `cycle` counts phrases, so on a clock it has nothing to say; the direction
@@ -583,7 +620,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
     };
     let rx = cols.saturating_sub(right.chars().count() + 2);
     if rx > s.x + 2 {
-        write_text(o, cols, rx, y, &right, style::mix(BG, CYAN, a));
+        write_text(o, cols, rx, y, &right, style::mix(p.bg, p.accent, a));
         // Key hints fill the gap, but only when there's room to read them.
         let kx = s.x + 2;
         let avail = rx.saturating_sub(kx + 2);
@@ -622,16 +659,21 @@ fn strip_words(
     lbl: Rgb,
     val: Rgb,
 ) {
-    let hot = style::mix(BG, AMBER, a);
+    let p = e.palette;
+    let hot = style::mix(p.bg, p.alert, a);
     let phase_c = match e.phase {
-        Phase::Holding => style::mix(BG, GREEN, a),
-        Phase::Gap | Phase::Resting => style::mix(BG, DIM, a),
-        _ => style::mix(BG, MAGENTA, a),
+        Phase::Holding => style::mix(p.bg, p.success, a),
+        Phase::Gap | Phase::Resting => style::mix(p.bg, p.dim, a),
+        _ => style::mix(p.bg, p.secondary, a),
     };
     s.value(o, y, e.phase.label(), phase_c);
     s.value(o, y, &format!("{:.1}", e.cps()), val);
     s.label(o, y, "cps", lbl);
-    let hold = if e.phase == Phase::Holding { e.hold } else { e.hold_total };
+    let hold = if e.phase == Phase::Holding {
+        e.hold
+    } else {
+        e.hold_total
+    };
     s.label(o, y, "hold", lbl);
     s.value(o, y, &format!("{hold:.1}s"), val);
     s.label(o, y, "rate", lbl);
@@ -652,10 +694,11 @@ fn strip_timer(
     lbl: Rgb,
     val: Rgb,
 ) {
+    let p = e.palette;
     let state_c = match e.phase {
-        Phase::Running => style::mix(BG, GREEN, a),
-        Phase::Ready | Phase::Paused => style::mix(BG, AMBER, a),
-        Phase::Done => style::mix(BG, MAGENTA, a),
+        Phase::Running => style::mix(p.bg, p.success, a),
+        Phase::Ready | Phase::Paused => style::mix(p.bg, p.alert, a),
+        Phase::Done => style::mix(p.bg, p.secondary, a),
         _ => lbl,
     };
     // The number is the point, so it goes first and largest; the state label
@@ -670,7 +713,11 @@ fn strip_timer(
     s.label(
         o,
         y,
-        if e.timer.down { "countdown" } else { "count up" },
+        if e.timer.down {
+            "countdown"
+        } else {
+            "count up"
+        },
         lbl,
     );
 }
@@ -712,9 +759,10 @@ fn strip_deadline(
     lbl: Rgb,
     val: Rgb,
 ) {
+    let p = e.palette;
     let state_c = match e.phase {
-        Phase::Running => style::mix(BG, GREEN, a),
-        Phase::Done => style::mix(BG, MAGENTA, a),
+        Phase::Running => style::mix(p.bg, p.success, a),
+        Phase::Done => style::mix(p.bg, p.secondary, a),
         _ => lbl,
     };
     // The seconds are the point; the name and the moment follow, because a
@@ -742,14 +790,20 @@ fn workspace_rect(cols: usize, rows: usize) -> (usize, usize, usize, usize) {
     (1, 1, cols.saturating_sub(2), rows.saturating_sub(2))
 }
 
-fn workspace_layer(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+fn workspace_layer(
+    e: &Engine,
+    o: &mut Out,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize, usize, usize) {
     let (x, y, w, h) = workspace_rect(cols, rows);
     let a = e.hud.max(0.5);
-    let edge = style::mix(BG, CYAN, a);
+    let p = e.palette;
+    let edge = style::mix(p.bg, p.accent, a);
 
     // Opaque: the panel owns its rect for as long as it is up.
     for row in 0..h {
-        style::cells(o, x, y + row, w, BG);
+        style::cells(o, x, y + row, w, p.bg);
     }
     let (bx, by, bw, bh) = (x + 1, y, w.saturating_sub(2), h);
     if bw < 4 || bh < 5 {
@@ -780,13 +834,14 @@ fn todo_screen(
     let hint_y = by + bh - 2;
     let list_rows = hint_y.saturating_sub(top).max(1);
     let a = a.max(0.5);
-    let dimc = style::mix(BG, DIM, a);
-    let itemc = style::mix(BG, FG, a);
-    let selc = style::mix(BG, CYAN, a);
-    let selbg = style::mix(BG, CYAN, a * 0.22);
-    let donec = style::mix(BG, DIM, a);
-    let tickc = style::mix(BG, GREEN, a);
-    let title_c = style::mix(BG, FG, a);
+    let p = e.palette;
+    let dimc = style::mix(p.bg, p.dim, a);
+    let itemc = style::mix(p.bg, p.fg, a);
+    let selc = style::mix(p.bg, p.accent, a);
+    let selbg = style::mix(p.bg, p.accent, a * 0.22);
+    let donec = style::mix(p.bg, p.dim, a);
+    let tickc = style::mix(p.bg, p.success, a);
+    let title_c = style::mix(p.bg, p.fg, a);
 
     let open = e.todos.iter().filter(|t| !t.done).count();
     let title = format!("TODO · {open} OPEN / {} TOTAL", e.todos.len());
@@ -866,14 +921,7 @@ fn todo_screen(
             if caret {
                 write_text(o, cols, inner_x + 3 + shown.chars().count(), ry, "▌", selc);
             }
-            write_text(
-                o,
-                cols,
-                inner_x + 3 + shown.chars().count(),
-                ry,
-                "]",
-                selc,
-            );
+            write_text(o, cols, inner_x + 3 + shown.chars().count(), ry, "]", selc);
         }
     }
 
@@ -882,7 +930,14 @@ fn todo_screen(
     } else {
         "up/down move   space tick   a add   x delete   c clear done   t mode   m menu"
     };
-    write_text(o, cols, bx + 2, hint_y, &truncate(hint, bw.saturating_sub(4)), dimc);
+    write_text(
+        o,
+        cols,
+        bx + 2,
+        hint_y,
+        &truncate(hint, bw.saturating_sub(4)),
+        dimc,
+    );
 }
 
 fn plan_screen(
@@ -900,12 +955,13 @@ fn plan_screen(
     let top = by + 3;
     let hint_y = by + bh - 2;
     let a = a.max(0.5);
-    let dimc = style::mix(BG, DIM, a);
-    let itemc = style::mix(BG, FG, a);
-    let selc = style::mix(BG, CYAN, a);
-    let selbg = style::mix(BG, CYAN, a * 0.22);
-    let title_c = style::mix(BG, FG, a);
-    let bar = style::mix(BG, CYAN, a);
+    let p = e.palette;
+    let dimc = style::mix(p.bg, p.dim, a);
+    let itemc = style::mix(p.bg, p.fg, a);
+    let selc = style::mix(p.bg, p.accent, a);
+    let selbg = style::mix(p.bg, p.accent, a * 0.22);
+    let title_c = style::mix(p.bg, p.fg, a);
+    let bar = style::mix(p.bg, p.accent, a);
 
     let day = if e.plan_day == i64::MIN {
         e.today()
@@ -944,9 +1000,7 @@ fn plan_screen(
     // bar shrinks to whatever is left.
     let time_w = if inner_w >= 30 { 11 } else { 8 };
     let gap = 2;
-    let name_w = inner_w
-        .saturating_sub(time_w + gap + gap + 6)
-        .min(24);
+    let name_w = inner_w.saturating_sub(time_w + gap + gap + 6).min(24);
     let bar_x = inner_x + time_w + gap + if name_w > 0 { name_w + gap } else { 0 };
     let right = bx + bw - 2;
     let bar_w = right.saturating_sub(bar_x);
@@ -1003,11 +1057,8 @@ fn plan_screen(
         if bar_w > 0 {
             let sx = bar_x + (ev.start as usize * bar_w / 1440).min(bar_w - 1);
             let ex = bar_x + ev.end as usize * bar_w / 1440;
-            let len = ex
-                .saturating_sub(sx)
-                .max(1)
-                .min(right.saturating_sub(sx));
-            style::cells(o, sx, ry, len, if sel { FG } else { bar });
+            let len = ex.saturating_sub(sx).max(1).min(right.saturating_sub(sx));
+            style::cells(o, sx, ry, len, if sel { p.fg } else { bar });
         }
     }
 
@@ -1017,9 +1068,9 @@ fn plan_screen(
         let now = Wall::from_local(e.local);
         let mins = (now.hour * 60 + now.min) as usize;
         let mx = bar_x + (mins * bar_w / 1440).min(bar_w - 1);
-        style::cells(o, mx, top, 1, MAGENTA);
+        style::cells(o, mx, top, 1, p.secondary);
         for vi in 0..rows.min(indices.len().saturating_sub(first)) {
-            style::cells(o, mx, events_top + vi, 1, MAGENTA);
+            style::cells(o, mx, events_top + vi, 1, p.secondary);
         }
     }
 
@@ -1064,23 +1115,30 @@ fn plan_form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize
         return (0, 0, 0, 0);
     };
     let a = e.hud.max(0.5);
-    let title = if f.edit.is_some() { "EDIT EVENT" } else { "NEW EVENT" };
+    let title = if f.edit.is_some() {
+        "EDIT EVENT"
+    } else {
+        "NEW EVENT"
+    };
     let hint = "type to fill   tab / left right field   enter save   esc cancel";
 
-    let w = (hint.len() + 6).max(title.len() + 6).min(cols.saturating_sub(2));
+    let w = (hint.len() + 6)
+        .max(title.len() + 6)
+        .min(cols.saturating_sub(2));
     let h = 9.min(rows.saturating_sub(2));
     let x = (cols.saturating_sub(w)) / 2;
     let y = (rows.saturating_sub(h)) / 2;
 
-    let edge = style::mix(BG, CYAN, a);
-    let title_c = style::mix(BG, FG, a);
-    let dimc = style::mix(BG, DIM, a);
-    let valc = style::mix(BG, FG, a);
-    let selc = style::mix(BG, CYAN, a);
-    let errc = style::mix(BG, MAGENTA, a);
+    let p = e.palette;
+    let edge = style::mix(p.bg, p.accent, a);
+    let title_c = style::mix(p.bg, p.fg, a);
+    let dimc = style::mix(p.bg, p.dim, a);
+    let valc = style::mix(p.bg, p.fg, a);
+    let selc = style::mix(p.bg, p.accent, a);
+    let errc = style::mix(p.bg, p.secondary, a);
 
     for row in 0..h {
-        style::cells(o, x, y + row, w, BG);
+        style::cells(o, x, y + row, w, p.bg);
     }
     box_border(o, cols, x, y, w, h, edge);
     write_text(
@@ -1095,11 +1153,7 @@ fn plan_form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize
     // The session clock is parked in a workspace, so the caret blinks on the
     // idle clock instead.
     let caret = (e.idle * 2.0).fract() < 0.55;
-    let fields: [(&str, &String); 3] = [
-        ("NAME", &f.name),
-        ("START", &f.start),
-        ("END", &f.end),
-    ];
+    let fields: [(&str, &String); 3] = [("NAME", &f.name), ("START", &f.start), ("END", &f.end)];
     for (i, (label, buf)) in fields.iter().enumerate() {
         let ry = y + 2 + i;
         let on = i == f.field;
@@ -1143,15 +1197,16 @@ fn boot(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     let x = (cols - w) / 2;
     let y = rows / 2;
 
-    style::cells(o, x, y, w, style::mix(BG, FAINT, 0.9));
+    let p = e.palette;
+    style::cells(o, x, y, w, style::mix(p.bg, p.faint, 0.9));
     let fill = (w as f64 * t).round() as usize;
-    style::cells(o, x, y, fill, CYAN);
+    style::cells(o, x, y, fill, p.accent);
     if fill > 0 {
-        style::cells(o, x + fill - 1, y, 2, FG);
+        style::cells(o, x + fill - 1, y, 2, p.fg);
     }
     let msg = "INITIALISING";
     let mx = (cols - msg.len()) / 2;
-    write_text(o, cols, mx, y + 2, msg, DIM);
+    write_text(o, cols, mx, y + 2, msg, p.dim);
 
     // The bar and the message are both centred, so a full-width band over the
     // three rows they use is correct and simpler than a union of two rects.
@@ -1230,8 +1285,16 @@ struct Panel {
 }
 
 fn panel_for(rows: &[(&str, &str)], cols: usize, screen_rows: usize) -> Panel {
-    let key_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(12);
-    let val_w = rows.iter().map(|(_, v)| v.chars().count()).max().unwrap_or(20);
+    let key_w = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(12);
+    let val_w = rows
+        .iter()
+        .map(|(_, v)| v.chars().count())
+        .max()
+        .unwrap_or(20);
     // panel = 1 border + 2 pad + key + 2 gutter + val + 1 border
     let want = 3 + key_w + 2 + val_w + 1;
     let w = want.min(cols.saturating_sub(2));
@@ -1250,14 +1313,15 @@ fn help(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     let items = help_rows(e);
     let p = panel_for(&items, cols, rows);
     let a = e.hud.max(0.5);
-    let edge = style::mix(BG, CYAN, a);
-    let title_c = style::mix(BG, FG, a);
-    let keyc = style::mix(BG, FG, a);
-    let valc = style::mix(BG, CYAN, a);
+    let pal = e.palette;
+    let edge = style::mix(pal.bg, pal.accent, a);
+    let title_c = style::mix(pal.bg, pal.fg, a);
+    let keyc = style::mix(pal.bg, pal.fg, a);
+    let valc = style::mix(pal.bg, pal.accent, a);
 
     // Solid backdrop so the panel reads over the words behind it.
     for row in 0..p.h {
-        style::cells(o, p.x, p.y + row, p.w, BG);
+        style::cells(o, p.x, p.y + row, p.w, pal.bg);
     }
     box_border(o, cols, p.x, p.y, p.w, p.h, edge);
 
@@ -1305,23 +1369,34 @@ fn help(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     (p.x, p.y, p.w, p.h)
 }
 
-/// The picker: the modes, the deadlines, and any phrase files found under
-/// the config directory, in titled sections. Returns the panel rect, so the
-/// frame that closes it can wipe it.
+/// The menu: the mode map, deadlines, phrase files and the settings pages.
+/// Returns the panel rect, so the frame that closes it can wipe it.
 fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
     let items = &e.menu;
     let a = e.hud.max(0.5);
-    let title = "SELECT";
-    let hint = "up/down move   enter open   x delete   esc close";
+    let p = e.palette;
+    let (title, hint) = if e.auto_menu {
+        let page = e.menu_stack.last().copied().unwrap_or(MenuPage::Main);
+        (page.title(), page.hint())
+    } else {
+        ("SELECT", "up/down move   enter open   x delete   esc close")
+    };
     let empty = "nothing here yet";
 
     let label_w = items
         .iter()
-        .map(|it| it.label.chars().count() + if it.kind == MenuKind::Head { 6 } else { 0 })
+        .map(|it| {
+            it.label.chars().count()
+                + match it.kind {
+                    MenuKind::Head => 6,
+                    MenuKind::Info => 4,
+                    _ => 4,
+                }
+        })
         .max()
         .unwrap_or(0);
     let content = label_w.max(if items.is_empty() { empty.len() } else { 0 });
-    let w = (content + 8)
+    let w = (content + 6)
         .max(title.len() + 6)
         .max(hint.len() + 4)
         .min(cols.saturating_sub(2));
@@ -1329,16 +1404,18 @@ fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     let x = (cols.saturating_sub(w)) / 2;
     let y = (rows.saturating_sub(h)) / 2;
 
-    let edge = style::mix(BG, CYAN, a);
-    let title_c = style::mix(BG, FG, a);
-    let dimc = style::mix(BG, DIM, a);
-    let itemc = style::mix(BG, FG, a);
-    let selc = style::mix(BG, CYAN, a);
-    let selbg = style::mix(BG, CYAN, a * 0.22);
+    let edge = style::mix(p.bg, p.accent, a);
+    let title_c = style::mix(p.bg, p.fg, a);
+    let dimc = style::mix(p.bg, p.dim, a);
+    let infoc = style::mix(p.bg, p.faint, a.max(0.5));
+    let itemc = style::mix(p.bg, p.fg, a);
+    let activec = style::mix(p.bg, p.success, a);
+    let selc = style::mix(p.bg, p.accent, a);
+    let selbg = style::mix(p.bg, p.accent, a * 0.22);
 
     // Solid backdrop so the rows read over whatever is behind them.
     for row in 0..h {
-        style::cells(o, x, y + row, w, BG);
+        style::cells(o, x, y + row, w, p.bg);
     }
     box_border(o, cols, x, y, w, h, edge);
     write_text(
@@ -1357,13 +1434,17 @@ fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     // Show as many rows as the panel holds, scrolled so the selection stays in
     // view when the list is longer than the window.
     let cap = h.saturating_sub(6).max(1);
-    let first = if e.menu_sel >= cap { e.menu_sel + 1 - cap } else { 0 };
-    let room = w.saturating_sub(7);
+    let first = if e.menu_sel >= cap {
+        e.menu_sel + 1 - cap
+    } else {
+        0
+    };
+    let room = w.saturating_sub(9);
     // Number keys open rows directly, so they count what can actually be
     // opened -- a section heading does not take a number.
     let mut numbered = 0;
     for i in 0..first {
-        if items[i].kind != MenuKind::Head {
+        if items[i].kind.selectable() {
             numbered += 1;
         }
     }
@@ -1376,29 +1457,107 @@ fn menu(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
             write_text(o, cols, x + 2, ry, &line, dimc);
             continue;
         }
+        if it.kind == MenuKind::Info {
+            let line = truncate(&it.label, room.max(4));
+            write_text(o, cols, x + 4, ry, &line, infoc);
+            continue;
+        }
 
         let sel = i == e.menu_sel;
         if sel {
             style::cells(o, x + 1, ry, w - 2, selbg);
         }
-        let label: String = if it.label.chars().count() > room {
-            let mut t: String = it.label.chars().take(room.saturating_sub(1)).collect();
-            t.push('\u{2026}');
-            t
-        } else {
-            it.label.clone()
-        };
+        let label = truncate(&it.label, room);
         let num = if numbered < 9 {
             char::from(b'1' + numbered as u8)
         } else {
             ' '
         };
-        let line = format!("{} {} {}", if sel { '>' } else { ' ' }, num, label);
-        write_text(o, cols, x + 2, ry, &line, if sel { selc } else { itemc });
+        let mark = if it.active { '●' } else { ' ' };
+        let line = format!("{} {} {} {}", if sel { '>' } else { ' ' }, num, mark, label);
+        let c = if sel {
+            selc
+        } else if it.active {
+            activec
+        } else {
+            itemc
+        };
+        write_text(o, cols, x + 2, ry, &line, c);
         numbered += 1;
     }
 
     write_text(o, cols, x + 2, y + h - 2, hint, dimc);
+    (x, y, w, h)
+}
+
+// -- the custom-colour form -------------------------------------------------
+
+/// The little RGB/HEX field opened from the colour page. Returns the panel
+/// rect, so the frame that closes it can wipe it.
+fn color_form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+    let Some(f) = &e.color_form else {
+        return (0, 0, 0, 0);
+    };
+    let a = e.hud.max(0.5);
+    let p = e.palette;
+    let title = "CUSTOM COLOUR";
+    let hint = "enter save   empty resets to theme   esc cancel";
+    let w = (hint.len() + 6)
+        .max(title.len() + 6)
+        .min(cols.saturating_sub(2));
+    let h = 7.min(rows.saturating_sub(2));
+    let x = (cols.saturating_sub(w)) / 2;
+    let y = (rows.saturating_sub(h)) / 2;
+
+    let edge = style::mix(p.bg, p.accent, a);
+    let title_c = style::mix(p.bg, p.fg, a);
+    let dimc = style::mix(p.bg, p.dim, a);
+    let valc = style::mix(p.bg, p.fg, a);
+    let selc = style::mix(p.bg, p.accent, a);
+    let errc = style::mix(p.bg, p.secondary, a);
+
+    for row in 0..h {
+        style::cells(o, x, y + row, w, p.bg);
+    }
+    box_border(o, cols, x, y, w, h, edge);
+    write_text(
+        o,
+        cols,
+        x + (w.saturating_sub(title.chars().count())) / 2,
+        y + 1,
+        title,
+        title_c,
+    );
+
+    let label = f.role.name();
+    write_text(o, cols, x + 3, y + 2, label, dimc);
+    let bx = x + 3 + label.chars().count() + 2;
+    let room = w.saturating_sub(bx - x + 3);
+    let caret = (e.idle * 2.0).fract() < 0.55;
+    write_text(o, cols, bx, y + 2, "[", selc);
+    if f.text.is_empty() {
+        let shown = truncate("RRGGBB or R,G,B", room);
+        write_text(o, cols, bx + 1, y + 2, &shown, dimc);
+    } else {
+        let shown = truncate(&f.text, room);
+        write_text(o, cols, bx + 1, y + 2, &shown, valc);
+        if caret {
+            write_text(o, cols, bx + 1 + shown.chars().count(), y + 2, "▌", selc);
+        }
+    }
+    write_text(
+        o,
+        cols,
+        bx + 1 + f.text.chars().count().min(room),
+        y + 2,
+        "]",
+        selc,
+    );
+
+    match &f.err {
+        Some(msg) => write_text(o, cols, x + 2, y + h - 2, msg, errc),
+        None => write_text(o, cols, x + 2, y + h - 2, hint, dimc),
+    }
     (x, y, w, h)
 }
 
@@ -1414,20 +1573,23 @@ fn form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     let title = "NEW DEADLINE";
     let hint = "type to fill   tab / left right field   enter save   esc cancel";
 
-    let w = (hint.len() + 6).max(title.len() + 6).min(cols.saturating_sub(2));
+    let w = (hint.len() + 6)
+        .max(title.len() + 6)
+        .min(cols.saturating_sub(2));
     let h = 9.min(rows.saturating_sub(2));
     let x = (cols.saturating_sub(w)) / 2;
     let y = (rows.saturating_sub(h)) / 2;
 
-    let edge = style::mix(BG, CYAN, a);
-    let title_c = style::mix(BG, FG, a);
-    let dimc = style::mix(BG, DIM, a);
-    let valc = style::mix(BG, FG, a);
-    let selc = style::mix(BG, CYAN, a);
-    let errc = style::mix(BG, MAGENTA, a);
+    let pal = e.palette;
+    let edge = style::mix(pal.bg, pal.accent, a);
+    let title_c = style::mix(pal.bg, pal.fg, a);
+    let dimc = style::mix(pal.bg, pal.dim, a);
+    let valc = style::mix(pal.bg, pal.fg, a);
+    let selc = style::mix(pal.bg, pal.accent, a);
+    let errc = style::mix(pal.bg, pal.secondary, a);
 
     for row in 0..h {
-        style::cells(o, x, y + row, w, BG);
+        style::cells(o, x, y + row, w, pal.bg);
     }
     box_border(o, cols, x, y, w, h, edge);
     write_text(
@@ -1443,11 +1605,7 @@ fn form(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> (usize, usize, usi
     // screen's own sixty-a-second. It rides the idle clock, which keeps running
     // even when a workspace has parked the session clock.
     let caret = (e.idle * 2.0).fract() < 0.55;
-    let fields: [(&str, &String); 3] = [
-        ("NAME", &f.name),
-        ("DATE", &f.date),
-        ("TIME", &f.time),
-    ];
+    let fields: [(&str, &String); 3] = [("NAME", &f.name), ("DATE", &f.date), ("TIME", &f.time)];
     for (i, (label, buf)) in fields.iter().enumerate() {
         let ry = y + 2 + i;
         let on = i == f.field;
@@ -1494,7 +1652,14 @@ fn box_border(o: &mut Out, cols: usize, x: usize, y: usize, w: usize, h: usize, 
     let hz: &str = "\u{2500}";
     let vt: &str = "\u{2502}";
     write_text(o, cols, x, y, &format!("{tl}{}{tr}", hz.repeat(w - 2)), c);
-    write_text(o, cols, x, y + h - 1, &format!("{bl}{}{br}", hz.repeat(w - 2)), c);
+    write_text(
+        o,
+        cols,
+        x,
+        y + h - 1,
+        &format!("{bl}{}{br}", hz.repeat(w - 2)),
+        c,
+    );
     for i in 1..h - 1 {
         write_text(o, cols, x, y + i, vt, c);
         write_text(o, cols, x + w - 1, y + i, vt, c);
@@ -1542,9 +1707,9 @@ fn write_char(o: &mut Out, cols: usize, x: usize, y: usize, ch: char, c: Rgb) {
     ));
 }
 
-fn erase_box(o: &mut Out, x: usize, y: usize, w: usize, h: usize) {
+fn erase_box(o: &mut Out, x: usize, y: usize, w: usize, h: usize, bg: Rgb) {
     for i in 0..h {
-        style::cells(o, x, y + i, w, BG);
+        style::cells(o, x, y + i, w, bg);
     }
 }
 
@@ -1630,7 +1795,10 @@ mod tests {
         assert!(f.contains("09:00-10:30"), "with its span");
         assert!(f.contains("LUNCH"), "and so is the second");
         assert!(f.contains("12:30-13:15"), "with its own span");
-        assert!(f.contains("00") && f.contains("24"), "the day axis is labelled");
+        assert!(
+            f.contains("00") && f.contains("24"),
+            "the day axis is labelled"
+        );
         assert!(e.workspace.is_some(), "the workspace records its rect");
     }
 
@@ -1665,6 +1833,68 @@ mod tests {
         e.update(1.0);
         let second = frame(&mut e);
         assert_eq!(first, second, "nothing on the todo screen ticks over");
+    }
+
+    #[test]
+    fn the_menu_draws_its_page_title_and_the_active_choice() {
+        let mut e = Engine::new(1, 100, 30);
+        e.phase = Phase::Typing;
+        e.set_now(0, 0);
+        e.open_menu();
+
+        let f = frame(&mut e);
+        assert!(f.contains("MENU"), "the main page has its own title");
+        for row in ["MODES", "APPEARANCE", "CONFIG", "CLOSE MENU"] {
+            assert!(f.contains(row), "the main page offers {row}");
+        }
+        assert!(f.contains('>'), "the selection has a marker");
+
+        let appearance = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Page(MenuPage::Appearance))
+            .expect("the appearance row");
+        e.menu_sel = appearance;
+        e.key(b'\n');
+
+        let f = frame(&mut e);
+        assert!(f.contains("APPEARANCE"), "the page title changes");
+        for row in ["CYBERPUNK", "FONT WIDTH 2", "PIN THE BAR", "CUSTOM COLOURS"] {
+            assert!(f.contains(row), "the appearance page offers {row}");
+        }
+        assert!(f.contains('●'), "the theme in force is marked");
+    }
+
+    #[test]
+    fn the_colour_form_draws_its_role_and_the_accepted_shapes() {
+        let mut e = Engine::new(1, 100, 30);
+        e.phase = Phase::Typing;
+        e.color_form = Some(crate::settings::ColorForm::new(
+            crate::settings::ColorRole::Accent,
+        ));
+
+        let f = frame(&mut e);
+        assert!(f.contains("CUSTOM COLOUR"), "the field has a title");
+        assert!(f.contains("ACCENT"), "and names what it is changing");
+        assert!(f.contains("RRGGBB or R,G,B"), "with the shapes it accepts");
+    }
+
+    #[test]
+    fn a_custom_background_reaches_the_panels_and_the_wipes() {
+        let mut e = Engine::new(1, 80, 24);
+        e.set_color(crate::settings::ColorRole::Background, Some([10, 20, 30]));
+        e.start_todo();
+        let f = frame(&mut e);
+        assert!(
+            f.contains("\x1b[48;2;10;20;30m"),
+            "the todo panel is painted in the custom background"
+        );
+
+        let (x, y, _, _) = e.workspace.expect("the panel records its rect");
+        e.start_timer(true, 60.0);
+        let f = frame(&mut e);
+        let wipe = format!("\x1b[{};{}H\x1b[48;2;10;20;30m", y + 1, x + 1);
+        assert!(f.contains(&wipe), "and the close repaint uses it too");
     }
 
     /// The words only wipe their own footprint, so the frame that leaves a

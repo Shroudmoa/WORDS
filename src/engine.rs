@@ -2,11 +2,12 @@
 
 use std::path::PathBuf;
 
-use crate::deadline::Deadline;
+use crate::deadline::{self, Deadline};
 use crate::font;
 use crate::phrases;
 use crate::plan::Event;
-use crate::style::{self, Rng};
+use crate::settings::{self, ColorForm, ColorRole, CustomColors, Settings};
+use crate::style::{self, Palette, Rng, Theme};
 use crate::time::{self, Wall};
 use crate::todo::Todo;
 
@@ -153,6 +154,9 @@ pub enum Action {
 pub struct MenuItem {
     pub label: String,
     pub kind: MenuKind,
+    /// The row is the value currently in force -- the theme that is on, the
+    /// font width that is set. Drawn with a marker rather than a tick box.
+    pub active: bool,
 }
 
 impl MenuItem {
@@ -160,6 +164,42 @@ impl MenuItem {
         MenuItem {
             label: label.into(),
             kind,
+            active: false,
+        }
+    }
+
+    pub fn active(mut self, on: bool) -> MenuItem {
+        self.active = on;
+        self
+    }
+}
+
+/// The pages of the menu. The main page is the map; the others are places you
+/// go to change something and come back from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuPage {
+    Main,
+    Appearance,
+    Colors,
+    Config,
+}
+
+impl MenuPage {
+    pub fn title(self) -> &'static str {
+        match self {
+            MenuPage::Main => "MENU",
+            MenuPage::Appearance => "APPEARANCE",
+            MenuPage::Colors => "CUSTOM COLOURS",
+            MenuPage::Config => "CONFIG",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            MenuPage::Main => "up/down move   enter open   x delete   esc close",
+            MenuPage::Appearance => "up/down move   enter choose   esc back",
+            MenuPage::Colors => "up/down move   enter edit   esc back",
+            MenuPage::Config => "up/down move   left/right adjust   esc back",
         }
     }
 }
@@ -175,6 +215,8 @@ pub enum MenuKind {
     Clock,
     /// A section heading: drawn, never chosen.
     Head,
+    /// A line of information: drawn, never chosen.
+    Info,
     /// The saved deadline with this index in the caller's list.
     Deadline(usize),
     /// The countdown to the turn of the year, which is always there.
@@ -187,6 +229,32 @@ pub enum MenuKind {
     Plan,
     /// Load the phrases out of this file and switch to the words.
     File(PathBuf),
+    /// Open another menu page.
+    Page(MenuPage),
+    /// Go back one page, or close the menu at the top.
+    Back,
+    /// Close the menu.
+    Close,
+    /// Switch to a built-in theme, dropping any custom colour overrides.
+    Theme(Theme),
+    /// Open the colour form on this role.
+    Color(ColorRole),
+    /// Set the pixel font's horizontal scale.
+    FontWidth(u8),
+    /// Turn the words' pixel font on or off.
+    TogglePixel,
+    /// Pin the control bar open.
+    TogglePin,
+    /// Nudge the typing speed by this many percent.
+    Speed(i8),
+    /// Forget every custom colour and go back to the theme.
+    ResetColors,
+}
+
+impl MenuKind {
+    pub fn selectable(&self) -> bool {
+        !matches!(self, MenuKind::Head | MenuKind::Info)
+    }
 }
 
 /// The add-a-deadline form: three fields, filled in one at a time.
@@ -370,9 +438,25 @@ pub struct Engine {
     pub rows: u16,
     /// Vertical scale of the pixel font only. Always 1 in terminal-font mode.
     pub cell_h: usize,
+    /// Horizontal scale of the pixel font: each source column becomes this
+    /// many cells. Independent of `cell_h`, so the font can be made wider
+    /// without making it taller.
+    pub font_width: u8,
     /// `true` = the terminal's own font (readable, the default).
     /// `false` = the 5x7 pixel font, drawn with background colour.
     pub pixel: bool,
+    /// The look the interface is wearing, before custom overrides.
+    pub theme: Theme,
+    /// The user's colour overrides for the main roles, if any.
+    pub custom: CustomColors,
+    /// The resolved colours every painter draws with.
+    pub palette: Palette,
+    /// Set when a visual preference changes and the settings file needs a
+    /// fresh write.
+    pub settings_dirty: bool,
+    /// Set when the page background itself changes, so the frame loop can
+    /// repaint the whole screen in the new colour.
+    pub page_dirty: bool,
     pub glitch: f64,
     pub next_glitch: f64,
     pub rand: Rng,
@@ -431,7 +515,7 @@ pub struct Engine {
     pub beep_in: f64,
 
     // -- the deadline ---------------------------------------------------------
-    /// Saved deadlines, handed in from the caller so the picker can name them
+    /// Saved deadlines, handed in from the caller so the menu can name them
     /// and the deletion keys know which one is which.
     pub deadlines: Vec<Deadline>,
     /// The countdown to the turn of the year, which is always worth having.
@@ -465,10 +549,19 @@ pub struct Engine {
     pub plan_form: Option<PlanForm>,
 
     // -- the menu -------------------------------------------------------------
-    /// The picker: modes plus any phrase files found under the config dir.
+    /// The menu: modes plus any phrase files found under the config dir.
     pub menu_open: bool,
     pub menu: Vec<MenuItem>,
     pub menu_sel: usize,
+    /// `true` while the menu is the engine's own hierarchical one. A caller
+    /// that hands in a flat list with [`set_menu`] keeps that list instead.
+    pub auto_menu: bool,
+    /// Page stack, deepest last. The main page is always at the bottom.
+    pub menu_stack: Vec<MenuPage>,
+    /// Phrase files the main page offers, refreshed by the caller.
+    pub phrase_files: Vec<PathBuf>,
+    /// The RGB/HEX field, up while a colour is being changed.
+    pub color_form: Option<ColorForm>,
     /// The rect a workspace mode (todo, planner) last painted, so the frame
     /// that leaves it can wipe the panel rather than leaving it on screen.
     pub workspace: Option<(usize, usize, usize, usize)>,
@@ -477,8 +570,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(seed: u64, cols: u16, rows: u16) -> Engine {
         let mut rand = Rng::new(seed);
-        let mut phrases: Vec<String> =
-            phrases::PRELUDE.iter().map(|s| s.to_string()).collect();
+        let mut phrases: Vec<String> = phrases::PRELUDE.iter().map(|s| s.to_string()).collect();
         let prelude = phrases.len();
         phrases.extend(phrases::pool(&mut rand));
         phrases::shuffle(&mut phrases[prelude..], &mut rand);
@@ -505,7 +597,13 @@ impl Engine {
             cols,
             rows,
             cell_h: 1,
+            font_width: settings::DEFAULT_FONT_WIDTH,
             pixel: false,
+            theme: Theme::Cyberpunk,
+            custom: CustomColors::default(),
+            palette: Theme::Cyberpunk.palette(),
+            settings_dirty: false,
+            page_dirty: false,
             glitch: 0.0,
             next_glitch: 99.0,
             rand,
@@ -548,11 +646,145 @@ impl Engine {
             menu_open: false,
             menu: Vec::new(),
             menu_sel: 0,
+            auto_menu: true,
+            menu_stack: Vec::new(),
+            phrase_files: Vec::new(),
+            color_form: None,
             workspace: None,
         };
         e.next_glitch = e.glitch_soon(GLITCH_AMBIENT.0, GLITCH_AMBIENT.1);
         e.load(0);
         e
+    }
+
+    // -- preferences ---------------------------------------------------------
+    //
+    // The engine owns the live copy so the menu can change a colour or a font
+    // width and have the next frame agree with it. The caller writes the file;
+    // `settings()` is the snapshot it saves.
+
+    /// Take on a whole saved configuration. Used once at startup, before the
+    /// first frame; the menu changes one field at a time through the setters
+    /// below so a theme change does not restart the phrase mid-sentence.
+    pub fn apply_settings(&mut self, s: &Settings) {
+        let s = s.sanitized();
+        self.theme = s.theme;
+        self.custom = s.custom;
+        self.font_width = s.font_width;
+        self.level = s.level;
+        self.pin = s.pin;
+        self.words_pixel = s.pixel_font;
+        self.palette = s.palette();
+        if self.mode == Mode::Words {
+            self.pixel = self.words_pixel;
+        }
+        self.font_changed();
+        self.settings_dirty = false;
+        self.page_dirty = true;
+        self.full = true;
+    }
+
+    /// What the settings file should say right now.
+    pub fn settings(&self) -> Settings {
+        Settings {
+            theme: self.theme,
+            custom: self.custom,
+            font_width: self.font_width,
+            pixel_font: self.words_pixel,
+            pin: self.pin,
+            level: self.level,
+        }
+        .sanitized()
+    }
+
+    fn refresh_palette(&mut self) {
+        self.palette = self.settings().palette();
+        self.full = true;
+        self.page_dirty = true;
+    }
+
+    /// Re-lay whatever is in the middle of the screen against the current font
+    /// metrics. A theme change does not need this; a width or pixel-font change
+    /// does.
+    fn font_changed(&mut self) {
+        match self.mode {
+            Mode::Words => {
+                let idx = self.idx;
+                self.load(idx);
+                if !matches!(self.phase, Phase::Boot | Phase::FadingOut | Phase::Resting) {
+                    self.phase = Phase::Typing;
+                }
+            }
+            Mode::Timer | Mode::Clock | Mode::Deadline => self.load_digits(),
+            Mode::Todo | Mode::Plan => {}
+        }
+        self.full = true;
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        // Choosing a built-in theme is also how you get out of custom colours:
+        // otherwise "Amber" could leave a custom accent pointing at cyan. That
+        // matters even when the theme named is the one already in force -- it
+        // is the obvious way to undo a custom colour and get the base back.
+        if self.theme == theme && !self.custom.any() {
+            return;
+        }
+        self.theme = theme;
+        self.custom.clear();
+        self.refresh_palette();
+        self.settings_dirty = true;
+    }
+
+    pub fn set_color(&mut self, role: ColorRole, value: Option<style::Rgb>) {
+        role.set(&mut self.custom, value);
+        self.refresh_palette();
+        self.settings_dirty = true;
+    }
+
+    pub fn clear_colors(&mut self) {
+        self.custom.clear();
+        self.refresh_palette();
+        self.settings_dirty = true;
+    }
+
+    pub fn set_font_width(&mut self, width: u8) {
+        let width = width.clamp(settings::MIN_FONT_WIDTH, settings::MAX_FONT_WIDTH);
+        if self.font_width == width {
+            return;
+        }
+        self.font_width = width;
+        self.font_changed();
+        self.settings_dirty = true;
+    }
+
+    pub fn set_words_pixel(&mut self, pixel: bool) {
+        self.words_pixel = pixel;
+        if self.mode == Mode::Words {
+            self.pixel = pixel;
+        }
+        self.font_changed();
+        self.settings_dirty = true;
+    }
+
+    pub fn set_pin(&mut self, pin: bool) {
+        self.pin = pin;
+        self.settings_dirty = true;
+    }
+
+    pub fn set_level(&mut self, level: f64) {
+        self.level = level.clamp(0.0, 100.0);
+        self.rapid = false;
+        self.schedule_hold();
+        self.settings_dirty = true;
+    }
+
+    /// Hand the menu the phrase files the caller found. The main page offers
+    /// them by name; the caller owns the directory scan.
+    pub fn set_phrase_files(&mut self, files: Vec<PathBuf>) {
+        self.phrase_files = files;
+        if self.auto_menu && self.menu_open {
+            self.refresh_menu();
+        }
     }
 
     // -- speed model ---------------------------------------------------------
@@ -664,6 +896,7 @@ impl Engine {
         };
         self.idx = idx;
         let max_w = self.max_text_cols();
+        let width = self.font_width as usize;
 
         // Try the requested scale, then the small one. A scale that shows the
         // whole phrase always wins; failing that, show as much as possible and
@@ -676,7 +909,7 @@ impl Engine {
             if rows == 0 {
                 continue; // no room for a single line at this scale
             }
-            let (mut lines, mut cut) = flow(&text, max_w, rows, pixel);
+            let (mut lines, mut cut) = flow(&text, max_w, rows, pixel, width);
             // Never hand back more rows than the window can show.
             if lines.len() > rows {
                 lines.truncate(rows);
@@ -701,11 +934,11 @@ impl Engine {
         // Nothing fit: the window is shorter than one line of text. Show a
         // single clipped line rather than nothing.
         let (cell_h, lines, cut) = best.unwrap_or_else(|| {
-            let (l, c) = flow(&text, max_w, 1, pixel);
+            let (l, c) = flow(&text, max_w, 1, pixel, width);
             (1, l, c)
         });
         self.cell_h = cell_h;
-        let gap = gap(pixel);
+        let gap = gap(pixel, width);
 
         // Centre each line inside the block, so a wrapped sentence reads as one
         // centred block rather than a ragged left-aligned column.
@@ -713,7 +946,7 @@ impl Engine {
             .iter()
             .map(|l| {
                 l.iter()
-                    .map(|word| word.chars().map(|c| char_w(pixel, c)).sum::<usize>())
+                    .map(|word| word.chars().map(|c| char_w(pixel, c, width)).sum::<usize>())
                     .sum::<usize>()
                     + gap * l.len().saturating_sub(1)
             })
@@ -728,10 +961,11 @@ impl Engine {
                     col += gap;
                 }
                 for c in word.chars() {
-                    let w = char_w(pixel, c);
+                    let w = char_w(pixel, c, width);
                     self.glyphs.push(Glyph {
                         ch: c,
-                        canvas: pixel.then(|| style::Canvas::from_font(&font::of(c), cell_h)),
+                        canvas: pixel
+                            .then(|| style::Canvas::from_font_scaled(&font::of(c), cell_h, width)),
                         col,
                         row,
                         w,
@@ -746,7 +980,8 @@ impl Engine {
             let last = self.glyphs.len().saturating_sub(1);
             if let Some(g) = self.glyphs.get_mut(last) {
                 g.ch = '.';
-                g.canvas = pixel.then(|| style::Canvas::from_font(&font::DOT, cell_h));
+                g.canvas =
+                    pixel.then(|| style::Canvas::from_font_scaled(&font::DOT, cell_h, width));
             }
         }
 
@@ -778,7 +1013,7 @@ impl Engine {
         self.glitch = self.glitch_soon(GLITCH_LEN.0, GLITCH_LEN.1);
     }
 
-    /// Whether one of the panels -- the picker, the help sheet, the deadline
+    /// Whether one of the panels -- the menu, the help sheet, the deadline
     /// form, the event form -- is in front of the words. They are the one thing
     /// the ambient animation must not play through. The todo list and the
     /// planner are workspaces rather than overlays, but they own the middle of
@@ -788,6 +1023,7 @@ impl Engine {
             || self.help
             || self.form.is_some()
             || self.plan_form.is_some()
+            || self.color_form.is_some()
             || matches!(self.mode, Mode::Todo | Mode::Plan)
     }
 
@@ -903,12 +1139,13 @@ impl Engine {
     fn load_digits(&mut self) {
         let text = self.digits_text();
         let pixel = self.pixel;
+        let width = self.font_width as usize;
         let max_w = self.max_text_cols().max(4);
         let avail = (self.rows as usize)
             .saturating_sub(self.chrome_rows())
             .max(1);
 
-        let want = clock_width(&text, pixel);
+        let want = clock_width(&text, pixel, width);
         let scales: &[usize] = if pixel { &[4, 3, 2, 1] } else { &[1] };
         // Largest scale whose height and width both fit; the smallest if none
         // do, so the clock is never drawn at a scale that overflows.
@@ -925,7 +1162,7 @@ impl Engine {
         let mut shown = String::new();
         let mut w = 0;
         for c in text.chars() {
-            let a = adv(pixel, c);
+            let a = adv(pixel, c, width);
             if !shown.is_empty() && w + a - 1 > max_w {
                 break;
             }
@@ -939,16 +1176,16 @@ impl Engine {
         self.glyphs.clear();
         let mut col = 0;
         for c in shown.chars() {
-            let cw = char_w(pixel, c);
+            let cw = char_w(pixel, c, width);
             self.glyphs.push(Glyph {
                 ch: c,
-                canvas: pixel.then(|| style::Canvas::from_font(&font::of(c), scale)),
+                canvas: pixel.then(|| style::Canvas::from_font_scaled(&font::of(c), scale, width)),
                 col,
                 row: 0,
                 w: cw,
                 at: None,
             });
-            col += adv(pixel, c);
+            col += adv(pixel, c, width);
         }
         // The whole string, not the digits that fitted: this is what the next
         // tick compares against, and on a window too narrow to show all of it
@@ -1397,7 +1634,7 @@ impl Engine {
 
     pub fn key(&mut self, b: u8) -> Action {
         self.idle = 0.0;
-        // The form, like the picker, owns the keyboard outright: a stray `W`
+        // The form, like the menu, owns the keyboard outright: a stray `W`
         // should go into the name field, not into the typing speed behind it.
         if self.form.is_some() {
             return self.form_key(b);
@@ -1407,7 +1644,12 @@ impl Engine {
         if self.plan_form.is_some() {
             return self.plan_form_key(b);
         }
-        // While the picker is up it owns the keyboard: a stray `W` should move
+        // The colour field is a text field too, so it comes before the menu
+        // that opened it.
+        if self.color_form.is_some() {
+            return self.color_form_key(b);
+        }
+        // While the menu is up it owns the keyboard: a stray `W` should move
         // the selection, not the typing speed behind the panel.
         if self.menu_open {
             return self.menu_key(b);
@@ -1429,14 +1671,12 @@ impl Engine {
             b'm' | b'M' => self.open_menu(),
             b't' | b'T' => self.cycle_mode(),
             b'g' | b'G' => self.kick(),
-            b'b' | b'B' => self.pin = !self.pin,
+            b'b' | b'B' => self.set_pin(!self.pin),
             b'f' | b'F' => self.toggle_font(),
             _ if self.mode == Mode::Todo => return self.todo_key(b),
             _ if self.mode == Mode::Plan => return self.plan_key(b),
             _ if self.mode == Mode::Timer => self.timer_key(b),
-            _ if self.mode == Mode::Clock || self.mode == Mode::Deadline => {
-                self.clock_key(b)
-            }
+            _ if self.mode == Mode::Clock || self.mode == Mode::Deadline => self.clock_key(b),
             _ => self.words_key(b),
         }
         Action::None
@@ -1456,7 +1696,7 @@ impl Engine {
     }
 
     /// `T` walks the modes in a ring. The deadline is only worth walking to
-    /// when there is one to show -- the picker always offers the turn of the
+    /// when there is one to show -- the menu always offers the turn of the
     /// year, but a bare engine with no deadlines should not dead-end there.
     /// The todo list and the planner are always there.
     fn cycle_mode(&mut self) {
@@ -1511,13 +1751,10 @@ impl Engine {
             }
             Mode::Clock => self.start_clock(),
             Mode::Deadline => {
-                // The one the picker last chose, or the turn of the year if
+                // The one the menu last chose, or the turn of the year if
                 // none has been chosen yet -- arriving here from `T` should
                 // always land on something worth counting down to.
-                let t = self
-                    .target
-                    .clone()
-                    .or_else(|| self.year.clone());
+                let t = self.target.clone().or_else(|| self.year.clone());
                 if let Some(t) = t {
                     self.start_deadline(t);
                 }
@@ -1532,22 +1769,259 @@ impl Engine {
 
     // -- the menu ------------------------------------------------------------
 
-    /// Hand the picker its rows. Called at startup and whenever the config
+    /// Hand the menu its rows. Called at startup and whenever the config
     /// directory is re-scanned, so a file dropped in there shows up.
+    ///
+    /// This is the legacy flat list: it switches the engine out of its own
+    /// hierarchical menu and uses exactly these rows. [`Engine::new`] starts in
+    /// auto mode, where the engine generates the pages itself from its state.
+    #[allow(dead_code)] // the flat-menu path is kept for callers and tests
     pub fn set_menu(&mut self, items: Vec<MenuItem>) {
+        self.auto_menu = false;
+        self.menu_stack.clear();
         self.menu = items;
-        if self.menu_sel >= self.menu.len() {
-            self.menu_sel = self.menu.len().saturating_sub(1);
+        self.menu_sel = self.menu_sel.min(self.menu.len().saturating_sub(1));
+        self.snap_menu_selection();
+    }
+
+    /// Rebuild the current page from the engine's own state. Nothing happens in
+    /// legacy mode, where the caller owns the list.
+    pub fn refresh_menu(&mut self) {
+        if !self.auto_menu {
+            return;
         }
-        // Headings are drawn but never chosen, so the selection starts on a
-        // row that actually opens something.
-        while self.menu.get(self.menu_sel).is_some_and(|m| m.kind == MenuKind::Head) {
-            if self.menu_sel + 1 < self.menu.len() {
-                self.menu_sel += 1;
-            } else {
-                break;
+        let page = self.menu_stack.last().copied().unwrap_or(MenuPage::Main);
+        self.menu = self.build_page(page);
+        self.menu_sel = self.menu_sel.min(self.menu.len().saturating_sub(1));
+        self.snap_menu_selection();
+    }
+
+    /// Keep the selection on a row that can actually be chosen.
+    fn snap_menu_selection(&mut self) {
+        let len = self.menu.len();
+        if len == 0 {
+            self.menu_sel = 0;
+            return;
+        }
+        if self.menu[self.menu_sel].kind.selectable() {
+            return;
+        }
+        // Prefer the next selectable row, then the previous one.
+        if let Some(i) = (self.menu_sel..len).find(|&i| self.menu[i].kind.selectable()) {
+            self.menu_sel = i;
+        } else if let Some(i) = (0..self.menu_sel)
+            .rev()
+            .find(|&i| self.menu[i].kind.selectable())
+        {
+            self.menu_sel = i;
+        }
+    }
+
+    fn build_page(&self, page: MenuPage) -> Vec<MenuItem> {
+        let mut v = Vec::new();
+        match page {
+            MenuPage::Main => {
+                v.push(MenuItem::new("MODES", MenuKind::Head));
+                for (label, kind, active) in [
+                    (
+                        "WORDS  ·  THE TYPEWRITER",
+                        MenuKind::Words,
+                        self.mode == Mode::Words,
+                    ),
+                    (
+                        "COUNTER  ·  TIMER",
+                        MenuKind::Counter,
+                        self.mode == Mode::Timer,
+                    ),
+                    (
+                        "CLOCK  ·  TIME OF DAY",
+                        MenuKind::Clock,
+                        self.mode == Mode::Clock,
+                    ),
+                    ("TODO LIST", MenuKind::Todo, self.mode == Mode::Todo),
+                    (
+                        "PLANNER  ·  THE DAY",
+                        MenuKind::Plan,
+                        self.mode == Mode::Plan,
+                    ),
+                ] {
+                    v.push(MenuItem::new(label, kind).active(active));
+                }
+
+                if self.year.is_some() || !self.deadlines.is_empty() {
+                    v.push(MenuItem::new("DEADLINES", MenuKind::Head));
+                    let utc = self.utc;
+                    if let Some(y) = &self.year {
+                        let (pct, _) = time::year_stats(self.local);
+                        let active = self.mode == Mode::Deadline
+                            && self.target.as_ref().is_some_and(|t| t.at == y.at);
+                        v.push(
+                            MenuItem::new(
+                                format!(
+                                    "END OF YEAR  ·  {pct:.1}% GONE  ·  {}",
+                                    deadline::short(y.at - utc)
+                                ),
+                                MenuKind::Year,
+                            )
+                            .active(active),
+                        );
+                    }
+                    for (i, d) in self.deadlines.iter().enumerate() {
+                        let active = self.mode == Mode::Deadline
+                            && self.target.as_ref().is_some_and(|t| t.at == d.at);
+                        v.push(
+                            MenuItem::new(
+                                format!("{}  ·  {}", d.name, deadline::short(d.at - utc)),
+                                MenuKind::Deadline(i),
+                            )
+                            .active(active),
+                        );
+                    }
+                    v.push(MenuItem::new("+ ADD A DEADLINE", MenuKind::Add));
+                }
+
+                if !self.phrase_files.is_empty() {
+                    v.push(MenuItem::new("PHRASES", MenuKind::Head));
+                    for path in &self.phrase_files {
+                        v.push(MenuItem::new(
+                            crate::config::label(path),
+                            MenuKind::File(path.clone()),
+                        ));
+                    }
+                }
+
+                v.push(MenuItem::new("SETTINGS", MenuKind::Head));
+                v.push(MenuItem::new(
+                    "APPEARANCE  ·  THEME, FONT, COLOURS",
+                    MenuKind::Page(MenuPage::Appearance),
+                ));
+                v.push(MenuItem::new(
+                    "CONFIG  ·  PATHS AND SPEED",
+                    MenuKind::Page(MenuPage::Config),
+                ));
+                v.push(MenuItem::new("CLOSE MENU", MenuKind::Close));
+            }
+            MenuPage::Appearance => {
+                v.push(MenuItem::new("THEME", MenuKind::Head));
+                for theme in Theme::ALL {
+                    v.push(
+                        MenuItem::new(theme.name(), MenuKind::Theme(theme))
+                            .active(self.theme == theme),
+                    );
+                }
+                v.push(MenuItem::new("PIXEL FONT", MenuKind::Head));
+                v.push(
+                    MenuItem::new(
+                        format!(
+                            "PIXEL FONT  ·  {}",
+                            if self.words_pixel { "ON" } else { "OFF" }
+                        ),
+                        MenuKind::TogglePixel,
+                    )
+                    .active(self.words_pixel),
+                );
+                for width in settings::MIN_FONT_WIDTH..=settings::MAX_FONT_WIDTH {
+                    let word = match width {
+                        1 => "NARROW",
+                        2 => "WIDE",
+                        _ => "WIDEST",
+                    };
+                    v.push(
+                        MenuItem::new(
+                            format!("FONT WIDTH {width}  ·  {word}"),
+                            MenuKind::FontWidth(width),
+                        )
+                        .active(self.font_width == width),
+                    );
+                }
+                v.push(MenuItem::new("CONTROL BAR", MenuKind::Head));
+                v.push(
+                    MenuItem::new(
+                        format!("PIN THE BAR  ·  {}", if self.pin { "ON" } else { "OFF" }),
+                        MenuKind::TogglePin,
+                    )
+                    .active(self.pin),
+                );
+                v.push(MenuItem::new("COLOURS", MenuKind::Head));
+                let n = ColorRole::ALL
+                    .iter()
+                    .filter(|r| r.is_custom(&self.custom))
+                    .count();
+                v.push(MenuItem::new(
+                    if n == 0 {
+                        "CUSTOM COLOURS  ·  ALL FROM THEME".to_string()
+                    } else {
+                        format!("CUSTOM COLOURS  ·  {n} SET")
+                    },
+                    MenuKind::Page(MenuPage::Colors),
+                ));
+                if self.custom.any() {
+                    v.push(MenuItem::new(
+                        "RESET TO THEME COLOURS",
+                        MenuKind::ResetColors,
+                    ));
+                }
+                v.push(MenuItem::new("BACK", MenuKind::Back));
+            }
+            MenuPage::Colors => {
+                v.push(MenuItem::new(
+                    "MAIN COLOURS  ·  ENTER TO EDIT  ·  EMPTY RESETS",
+                    MenuKind::Head,
+                ));
+                for role in ColorRole::ALL {
+                    let custom = role.is_custom(&self.custom);
+                    let shown = role.get(&self.palette);
+                    v.push(
+                        MenuItem::new(
+                            format!(
+                                "{}  ·  {}  ·  {}",
+                                role.name(),
+                                settings::hex(shown),
+                                if custom { "CUSTOM" } else { "THEME" }
+                            ),
+                            MenuKind::Color(role),
+                        )
+                        .active(custom),
+                    );
+                }
+                if self.custom.any() {
+                    v.push(MenuItem::new("RESET ALL COLOURS", MenuKind::ResetColors));
+                }
+                v.push(MenuItem::new("BACK", MenuKind::Back));
+            }
+            MenuPage::Config => {
+                v.push(MenuItem::new("SPEED", MenuKind::Head));
+                v.push(MenuItem::new(
+                    format!("SPEED  ·  {:.0}%  ·  {:.1} CPS", self.level, self.cps()),
+                    MenuKind::Speed(5),
+                ));
+                v.push(MenuItem::new("SLOWER  ·  LEFT", MenuKind::Speed(-5)));
+                v.push(MenuItem::new("FASTER  ·  RIGHT", MenuKind::Speed(5)));
+                v.push(MenuItem::new("LOCATIONS", MenuKind::Head));
+                let settings = crate::config::settings_file()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "not available".to_string());
+                let dir = crate::config::dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.config/words".to_string());
+                v.push(MenuItem::new(
+                    format!("SETTINGS  ·  {settings}"),
+                    MenuKind::Info,
+                ));
+                v.push(MenuItem::new(format!("PHRASES  ·  {dir}"), MenuKind::Info));
+                v.push(MenuItem::new(
+                    "DATA  ·  deadlines · todos · plan",
+                    MenuKind::Info,
+                ));
+                v.push(MenuItem::new("ABOUT", MenuKind::Head));
+                v.push(MenuItem::new(
+                    format!("WORDS  ·  VERSION {}", env!("CARGO_PKG_VERSION")),
+                    MenuKind::Info,
+                ));
+                v.push(MenuItem::new("BACK", MenuKind::Back));
             }
         }
+        v
     }
 
     pub fn open_menu(&mut self) {
@@ -1556,14 +2030,38 @@ impl Engine {
         self.full = true;
         self.idle = 0.0;
         self.hud_target = 1.0;
+        if self.auto_menu {
+            self.menu_stack.clear();
+            self.menu_stack.push(MenuPage::Main);
+            self.menu_sel = 0;
+            self.refresh_menu();
+        }
     }
 
     fn close_menu(&mut self) {
         self.menu_open = false;
+        self.color_form = None;
         self.full = true;
     }
 
-    /// Step the selection, skipping over the section headings.
+    /// Leave the current page for the one under it, closing the menu at the
+    /// main page. The legacy flat list has no pages, so escape closes it.
+    fn menu_back(&mut self) {
+        if !self.auto_menu {
+            self.close_menu();
+            return;
+        }
+        self.menu_stack.pop();
+        if self.menu_stack.is_empty() {
+            self.close_menu();
+            return;
+        }
+        self.menu_sel = 0;
+        self.refresh_menu();
+        self.full = true;
+    }
+
+    /// Step the selection, skipping over the section headings and info rows.
     fn menu_move(&mut self, dir: isize) {
         let n = self.menu.len() as isize;
         if n == 0 {
@@ -1572,7 +2070,7 @@ impl Engine {
         let mut i = self.menu_sel as isize;
         for _ in 0..n {
             i = (i + dir).rem_euclid(n);
-            if self.menu[i as usize].kind != MenuKind::Head {
+            if self.menu[i as usize].kind.selectable() {
                 self.menu_sel = i as usize;
                 return;
             }
@@ -1584,18 +2082,21 @@ impl Engine {
         self.menu
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.kind != MenuKind::Head)
+            .filter(|(_, m)| m.kind.selectable())
             .map(|(i, _)| i)
             .nth(n)
     }
 
-    /// Keys that only mean something while the picker is up.
+    /// Keys that only mean something while the menu is up.
     fn menu_key(&mut self, b: u8) -> Action {
         match b {
             b'q' | b'Q' | 0x03 | 0x04 => return Action::Quit,
-            b'm' | b'M' | 0x1b => self.close_menu(),
+            b'm' | b'M' => self.close_menu(),
+            0x1b => self.menu_back(),
             KEY_UP | b'k' | b'K' | b'w' | b'W' => self.menu_move(-1),
             KEY_DOWN | b'j' | b'J' | b's' | b'S' => self.menu_move(1),
+            KEY_LEFT => self.menu_adjust(-1),
+            KEY_RIGHT => self.menu_adjust(1),
             b' ' | b'\n' | b'\r' => return self.choose_menu(),
             // Delete the deadline under the selection. On any other row it
             // means nothing, and doing nothing is right: `x` next to a list
@@ -1612,6 +2113,22 @@ impl Engine {
         Action::None
     }
 
+    /// Left and right nudge the speed when a speed row is selected, so the
+    /// config page works the way its hint says it does. Everywhere else they
+    /// keep their up/down sense and step the selection.
+    fn menu_adjust(&mut self, dir: isize) {
+        let speed = self
+            .menu
+            .get(self.menu_sel)
+            .is_some_and(|m| matches!(m.kind, MenuKind::Speed(_)));
+        if speed {
+            self.set_level(self.level + dir as f64 * 5.0);
+            self.refresh_menu();
+        } else {
+            self.menu_move(dir);
+        }
+    }
+
     /// The `x` key: forget the highlighted deadline, if that is what it is.
     fn menu_delete(&mut self) -> Action {
         match self.menu.get(self.menu_sel).map(|m| m.kind.clone()) {
@@ -1623,16 +2140,75 @@ impl Engine {
         }
     }
 
-    /// Act on the highlighted row. The built-in rows switch mode here; files,
-    /// deletions and new deadlines belong to the caller, which hands them
-    /// back as actions.
+    /// Act on the highlighted row. The built-in rows switch mode or change a
+    /// preference here; files, deletions and new deadlines belong to the
+    /// caller, which hands them back as actions.
     fn choose_menu(&mut self) -> Action {
         let Some(item) = self.menu.get(self.menu_sel).cloned() else {
             self.close_menu();
             return Action::None;
         };
         match &item.kind {
-            MenuKind::Head => return Action::None,
+            MenuKind::Head | MenuKind::Info => return Action::None,
+            MenuKind::Page(page) => {
+                if self.auto_menu {
+                    self.menu_stack.push(*page);
+                }
+                self.menu_sel = 0;
+                self.refresh_menu();
+                self.full = true;
+                return Action::None;
+            }
+            MenuKind::Back => {
+                self.menu_back();
+                return Action::None;
+            }
+            MenuKind::Close => {
+                self.close_menu();
+                return Action::None;
+            }
+            MenuKind::Theme(theme) => {
+                self.set_theme(*theme);
+                self.notice = Some((theme.name().to_string(), 2.0));
+                self.refresh_menu();
+                return Action::None;
+            }
+            MenuKind::Color(role) => {
+                self.color_form = Some(ColorForm::new(*role));
+                self.full = true;
+                return Action::None;
+            }
+            MenuKind::FontWidth(width) => {
+                self.set_font_width(*width);
+                self.notice = Some((format!("FONT WIDTH {width}"), 1.5));
+                self.refresh_menu();
+                return Action::None;
+            }
+            MenuKind::TogglePixel => {
+                let on = !self.words_pixel;
+                self.set_words_pixel(on);
+                self.notice = Some((format!("PIXEL FONT {}", if on { "ON" } else { "OFF" }), 1.5));
+                self.refresh_menu();
+                return Action::None;
+            }
+            MenuKind::TogglePin => {
+                let pin = !self.pin;
+                self.set_pin(pin);
+                self.notice = Some((format!("BAR {}", if pin { "PINNED" } else { "AUTO" }), 1.5));
+                self.refresh_menu();
+                return Action::None;
+            }
+            MenuKind::Speed(delta) => {
+                self.set_level(self.level + *delta as f64);
+                self.refresh_menu();
+                return Action::None;
+            }
+            MenuKind::ResetColors => {
+                self.clear_colors();
+                self.notice = Some(("THEME COLOURS".to_string(), 1.5));
+                self.refresh_menu();
+                return Action::None;
+            }
             MenuKind::Add => {
                 self.close_menu();
                 self.form = Some(Form::defaults(&self.wall));
@@ -1666,12 +2242,64 @@ impl Engine {
             MenuKind::Plan => Mode::Plan,
             MenuKind::File(path) => return Action::OpenFile(path.clone()),
             // Handled above; the match only has to be exhaustive.
-            MenuKind::Head | MenuKind::Year | MenuKind::Deadline(_) | MenuKind::Add => {
-                return Action::None
-            }
+            _ => return Action::None,
         };
         self.set_mode(mode);
         self.notice = Some((item.label, 2.0));
+        Action::None
+    }
+
+    // -- the colour form -----------------------------------------------------
+
+    /// Keys while the little RGB/HEX field is up. Empty input on `enter` means
+    /// "go back to the theme's colour", which is why the field starts empty.
+    fn color_form_key(&mut self, b: u8) -> Action {
+        match b {
+            0x03 | 0x04 => return Action::Quit,
+            0x1b => {
+                self.color_form = None;
+                self.full = true;
+            }
+            b'\n' | b'\r' => return self.color_commit(),
+            0x7f | 0x08 => {
+                if let Some(f) = self.color_form.as_mut() {
+                    f.text.pop();
+                    f.err = None;
+                }
+            }
+            c if (c.is_ascii_graphic() || c == b' ') => {
+                if let Some(f) = self.color_form.as_mut() {
+                    if f.text.chars().count() < 20 {
+                        f.text.push(c as char);
+                        f.err = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn color_commit(&mut self) -> Action {
+        let Some(f) = self.color_form.clone() else {
+            return Action::None;
+        };
+        let text = f.text.trim().to_string();
+        if text.is_empty() {
+            self.set_color(f.role, None);
+            self.color_form = None;
+            self.notice = Some((format!("{} · THEME", f.role.name()), 1.8));
+        } else if let Some(c) = settings::parse_color(&text) {
+            self.set_color(f.role, Some(c));
+            self.color_form = None;
+            self.notice = Some((format!("{} · {}", f.role.name(), settings::hex(c)), 1.8));
+        } else if let Some(form) = self.color_form.as_mut() {
+            form.err = Some("USE #RRGGBB OR R, G, B".to_string());
+            self.full = true;
+            return Action::None;
+        }
+        self.refresh_menu();
+        self.full = true;
         Action::None
     }
 
@@ -1779,18 +2407,15 @@ impl Engine {
         if matches!(self.mode, Mode::Todo | Mode::Plan) {
             return;
         }
-        self.pixel = !self.pixel;
-        if matches!(self.mode, Mode::Timer | Mode::Clock | Mode::Deadline) {
-            self.load_digits();
+        // The words have a remembered font preference; a clock is always on the
+        // pixel font and flipping it here is just a look at the other one, so
+        // it must not overwrite that preference.
+        if self.mode == Mode::Words {
+            self.set_words_pixel(!self.words_pixel);
             return;
         }
-        let idx = self.idx;
-        self.load(idx);
-        if matches!(self.phase, Phase::FadingOut | Phase::Resting) {
-            self.phase = Phase::FadingOut;
-        } else {
-            self.phase = Phase::Typing;
-        }
+        self.pixel = !self.pixel;
+        self.load_digits();
     }
 
     fn words_key(&mut self, b: u8) {
@@ -1798,14 +2423,10 @@ impl Engine {
             b'r' | b'R' => self.rapid = !self.rapid,
             b' ' | b'\n' | b'\r' => self.skip(),
             b'w' | b'W' | b'+' | b'=' | KEY_UP => {
-                self.level = (self.level + 8.0).min(100.0);
-                self.rapid = false;
-                self.schedule_hold();
+                self.set_level(self.level + 8.0);
             }
             b's' | b'S' | b'-' | b'_' | KEY_DOWN => {
-                self.level = (self.level - 8.0).max(0.0);
-                self.rapid = false;
-                self.schedule_hold();
+                self.set_level(self.level - 8.0);
             }
             KEY_LEFT => {
                 if self.idx > 0 {
@@ -2230,20 +2851,23 @@ impl Engine {
 /// Greedy word wrap into at most `max_rows` lines of `max_w` columns.
 /// Returns the lines plus whether anything was cut for space.
 /// Cells one character occupies in the given font. The pixel font is 5 columns
-/// wide with a blank between glyphs; the terminal font is simply one cell.
-fn char_w(pixel: bool, c: char) -> usize {
+/// wide with a blank between glyphs; `width` repeats each of those columns, so
+/// a wider glyph is wider by exactly the same factor. The terminal font is
+/// simply one cell.
+fn char_w(pixel: bool, c: char, width: usize) -> usize {
     if pixel {
-        font::width(c)
+        font::width(c) * width.max(1)
     } else {
         1
     }
 }
 
 /// Cells between two words. The pixel font needs air around its 5-wide glyphs;
-/// a terminal font brings its own side bearings.
-fn gap(pixel: bool) -> usize {
+/// a terminal font brings its own side bearings. The air scales with the font,
+/// so widening the glyphs does not close the words up against each other.
+fn gap(pixel: bool, width: usize) -> usize {
     if pixel {
-        3
+        3 * width.max(1)
     } else {
         1
     }
@@ -2253,14 +2877,18 @@ fn gap(pixel: bool) -> usize {
 /// already includes the blank column it leaves between glyphs; the terminal
 /// font has nothing to show the difference between `2` and `5`, so one more
 /// cell of air is added or the clock reads as a single smear.
-fn adv(pixel: bool, c: char) -> usize {
-    char_w(pixel, c) + usize::from(!pixel)
+fn adv(pixel: bool, c: char, width: usize) -> usize {
+    char_w(pixel, c, width) + usize::from(!pixel)
 }
 
 /// Width of a whole clock string, not counting the gap that would follow the
 /// last digit.
-fn clock_width(text: &str, pixel: bool) -> usize {
-    text.chars().map(|c| adv(pixel, c)).sum::<usize>().max(1) - 1
+fn clock_width(text: &str, pixel: bool, width: usize) -> usize {
+    text.chars()
+        .map(|c| adv(pixel, c, width))
+        .sum::<usize>()
+        .max(1)
+        - 1
 }
 
 /// Total words in a laid-out phrase, used to compare clipped candidates.
@@ -2268,18 +2896,20 @@ fn words(lines: &[Vec<String>]) -> usize {
     lines.iter().map(|l| l.len()).sum()
 }
 
-fn flow(text: &str, max_w: usize, max_rows: usize, pixel: bool) -> (Vec<Vec<String>>, bool) {
-    let gap = gap(pixel);
+fn flow(
+    text: &str,
+    max_w: usize,
+    max_rows: usize,
+    pixel: bool,
+    width: usize,
+) -> (Vec<Vec<String>>, bool) {
+    let gap = gap(pixel, width);
     let mut lines: Vec<Vec<String>> = Vec::new();
     let mut line: Vec<String> = Vec::new();
     let mut used = 0usize;
     let total_words = text.split_whitespace().count();
 
-    fn push_line(
-        lines: &mut Vec<Vec<String>>,
-        line: &mut Vec<String>,
-        used: &mut usize,
-    ) {
+    fn push_line(lines: &mut Vec<Vec<String>>, line: &mut Vec<String>, used: &mut usize) {
         if !line.is_empty() {
             lines.push(std::mem::take(line));
             *used = 0;
@@ -2287,7 +2917,7 @@ fn flow(text: &str, max_w: usize, max_rows: usize, pixel: bool) -> (Vec<Vec<Stri
     }
 
     for word in text.split_whitespace() {
-        let w: usize = word.chars().map(|c| char_w(pixel, c)).sum();
+        let w: usize = word.chars().map(|c| char_w(pixel, c, width)).sum();
         let need = used + if line.is_empty() { 0 } else { gap } + w;
 
         if !line.is_empty() && need > max_w {
@@ -2302,7 +2932,7 @@ fn flow(text: &str, max_w: usize, max_rows: usize, pixel: bool) -> (Vec<Vec<Stri
             let mut chunk = String::new();
             let mut cw = 0usize;
             for c in word.chars() {
-                let cwid = char_w(pixel, c);
+                let cwid = char_w(pixel, c, width);
                 if cw + cwid > max_w && !chunk.is_empty() {
                     line.push(std::mem::take(&mut chunk));
                     push_line(&mut lines, &mut line, &mut used);
@@ -2494,7 +3124,11 @@ mod tests {
         while e.take_beep() {}
 
         e.key(b'u');
-        assert_eq!(e.phase, Phase::Ready, "the alarm went with the old direction");
+        assert_eq!(
+            e.phase,
+            Phase::Ready,
+            "the alarm went with the old direction"
+        );
         assert!(!e.alarming());
         assert!(!e.take_beep(), "and it rings no more bells");
         assert_eq!(e.text, "00:00");
@@ -2506,7 +3140,10 @@ mod tests {
         let mut e = running(80, 24, true, 1500.0);
         run(&mut e, 30.0);
         let used = e.timer.total - e.timer.value;
-        assert!(used > 29.0 && used < 31.0, "about thirty seconds used: {used}");
+        assert!(
+            used > 29.0 && used < 31.0,
+            "about thirty seconds used: {used}"
+        );
 
         e.key(b'+');
         assert_eq!(e.timer.total, 1530.0);
@@ -2532,7 +3169,10 @@ mod tests {
             e.key(b'-');
         }
         assert_eq!(e.timer.total, MIN_TIMER, "clamped at the floor");
-        assert!(e.timer.value <= e.timer.total, "and never shows more than it has");
+        assert!(
+            e.timer.value <= e.timer.total,
+            "and never shows more than it has"
+        );
     }
 
     #[test]
@@ -2568,7 +3208,10 @@ mod tests {
             rings += beeps(&mut e);
         }
         let during = rings;
-        assert!(during >= 5, "about one a second for {ALARM_TIME}s: {during}");
+        assert!(
+            during >= 5,
+            "about one a second for {ALARM_TIME}s: {during}"
+        );
 
         for _ in 0..600 {
             rings += beeps(&mut e);
@@ -2606,7 +3249,10 @@ mod tests {
                 );
                 prev = e.text.clone();
             }
-            assert!(ticks >= 19, "down={down}: about twenty ticks in forty seconds, got {ticks}");
+            assert!(
+                ticks >= 19,
+                "down={down}: about twenty ticks in forty seconds, got {ticks}"
+            );
         }
     }
 
@@ -2742,10 +3388,10 @@ mod tests {
         ]);
 
         e.key(b'm');
-        assert!(e.menu_open, "M brings the picker up");
+        assert!(e.menu_open, "M brings the menu up");
         assert!(!e.pixel, "and it owns the keyboard: no font flip behind it");
         e.key(b'f');
-        assert!(!e.pixel, "F did nothing while the picker was up");
+        assert!(!e.pixel, "F did nothing while the menu was up");
 
         // Row three is the clock, and picking it switches and closes.
         let action = e.key(b'3');
@@ -2775,7 +3421,7 @@ mod tests {
             Action::OpenFile(p) => assert_eq!(p, file),
             _ => panic!("a file row should be handed back to be read"),
         }
-        assert!(!e.menu_open, "picking anything closes the picker");
+        assert!(!e.menu_open, "picking anything closes the menu");
         assert_eq!(e.mode, Mode::Words, "switching is the caller's job here");
     }
 
@@ -2788,7 +3434,7 @@ mod tests {
         assert_eq!(e.menu_sel, 0, "nothing to move down onto");
         e.key(0x1b);
         assert!(!e.menu_open);
-        assert_eq!(e.mode, Mode::Words, "the picker changed nothing");
+        assert_eq!(e.mode, Mode::Words, "the menu changed nothing");
     }
 
     #[test]
@@ -2914,7 +3560,10 @@ mod tests {
             bg_rows(&next).contains(&cap_row),
             "row {cap_row} is wiped back to the page background on the move"
         );
-        assert!(next.contains("24:59"), "and the new digits are drawn over it");
+        assert!(
+            next.contains("24:59"),
+            "and the new digits are drawn over it"
+        );
     }
 
     /// Every zero-indexed row the frame paints a run of page-background cells
@@ -2941,9 +3590,10 @@ mod tests {
             if final_byte != 'H' {
                 continue;
             }
-            let Some((r, _c)) = params.split_once(';').and_then(|(r, c)| {
-                Some((r.parse::<usize>().ok()?, c.parse::<usize>().ok()?))
-            }) else {
+            let Some((r, _c)) = params
+                .split_once(';')
+                .and_then(|(r, c)| Some((r.parse::<usize>().ok()?, c.parse::<usize>().ok()?)))
+            else {
                 continue;
             };
             if !frame[i..].starts_with(BG_SGR) {
@@ -3031,14 +3681,22 @@ mod tests {
     #[test]
     fn both_fonts_centre_and_fit() {
         for pixel in [false, true] {
-            for (c, r) in [(200u16, 60u16), (100, 30), (80, 24), (60, 20), (44, 14), (30, 12)] {
+            for (c, r) in [
+                (200u16, 60u16),
+                (100, 30),
+                (80, 24),
+                (60, 20),
+                (44, 14),
+                (30, 12),
+            ] {
                 let mut e = eng(c, r);
                 e.pixel = pixel;
                 for p in phrases::pool(&mut Rng::new(11)) {
                     e.use_phrases(vec![p.clone()]);
                     let (bw, bh) = e.block_size();
                     let (x, y) = e.origin();
-                    let label = format!("{} @ {c}x{r}: {p:?}", if pixel { "pixel" } else { "term" });
+                    let label =
+                        format!("{} @ {c}x{r}: {p:?}", if pixel { "pixel" } else { "term" });
                     assert!(bw <= c as usize, "{label}: width {bw}");
                     assert!(bh <= r as usize, "{label}: height {bh}");
                     assert!(x + bw <= c as usize, "{label}: overflows right");
@@ -3077,7 +3735,7 @@ mod tests {
     fn narrow_windows_wrap_and_shrink() {
         let mut e = pixel_eng(40, 12);
         e.use_phrases(vec![
-            "THE CITY NEVER REALLY SLEEPS AND IT KNOWS YOUR NAME".into(),
+            "THE CITY NEVER REALLY SLEEPS AND IT KNOWS YOUR NAME".into()
         ]);
         let bw = e.block_width();
         let bh = e.block_size().1;
@@ -3147,7 +3805,14 @@ mod tests {
     #[test]
     fn text_block_never_eats_the_chrome() {
         for pixel in [false, true] {
-            for (c, r) in [(200u16, 60u16), (100, 30), (80, 24), (60, 20), (40, 14), (30, 12)] {
+            for (c, r) in [
+                (200u16, 60u16),
+                (100, 30),
+                (80, 24),
+                (60, 20),
+                (40, 14),
+                (30, 12),
+            ] {
                 let mut e = eng(c, r);
                 e.pixel = pixel;
                 for p in phrases::pool(&mut Rng::new(3)) {
@@ -3177,6 +3842,9 @@ mod tests {
     fn long_phrases_use_every_row_available() {
         let long = "EVERY MACHINE DREAMS IN ONES AND ZEROS";
         let mut e = pixel_eng(100, 30);
+        // The narrow scale keeps the old metric: this test is about spending
+        // the available rows, not about how wide each source column is.
+        e.font_width = 1;
         e.use_phrases(vec![long.into()]);
         assert_eq!(e.cell_h, 1, "drops a scale to gain rows for a long phrase");
         let rows = (30 - e.chrome_rows()) / 7;
@@ -3193,12 +3861,27 @@ mod tests {
         let mut e = pixel_eng(38, 44);
         e.use_phrases(vec!["THE HUM YOU HEAR IS THE WORLD THINKING".into()]);
         let nlines = e.glyphs.iter().map(|g| g.row + 1).max().unwrap();
-        assert!(nlines > 1, "this phrase must wrap at 38 columns, got {nlines} line(s)");
+        assert!(
+            nlines > 1,
+            "this phrase must wrap at 38 columns, got {nlines} line(s)"
+        );
         let bw = e.block_width();
         assert_eq!(e.block_size().1, nlines * 7 * e.cell_h);
         for r in 0..nlines {
-            let lo = e.glyphs.iter().filter(|g| g.row == r).map(|g| g.col).min().unwrap();
-            let hi = e.glyphs.iter().filter(|g| g.row == r).map(|g| g.col + g.w).max().unwrap();
+            let lo = e
+                .glyphs
+                .iter()
+                .filter(|g| g.row == r)
+                .map(|g| g.col)
+                .min()
+                .unwrap();
+            let hi = e
+                .glyphs
+                .iter()
+                .filter(|g| g.row == r)
+                .map(|g| g.col + g.w)
+                .max()
+                .unwrap();
             let left_pad = lo;
             let right_pad = bw - hi;
             assert!(
@@ -3211,14 +3894,16 @@ mod tests {
     #[test]
     fn flow_wraps_on_word_boundaries() {
         let width_of = |l: &[String]| -> usize {
-            l.iter().map(|x| x.chars().map(font::width).sum::<usize>()).sum::<usize>()
+            l.iter()
+                .map(|x| x.chars().map(font::width).sum::<usize>())
+                .sum::<usize>()
                 + 3 * l.len().saturating_sub(1)
         };
 
         // At 40 columns only one word fits per line, so this needs 5 rows and
         // asking for 4 must report a clip rather than silently overflowing.
         const MAX_W: usize = 40;
-        let (narrow, cut) = flow("THE CITY NEVER REALLY SLEEPS", MAX_W, 4, true);
+        let (narrow, cut) = flow("THE CITY NEVER REALLY SLEEPS", MAX_W, 4, true, 1);
         assert!(cut, "reports the clip when rows run out");
         assert_eq!(narrow.len(), 4, "never returns more rows than allowed");
         for l in &narrow {
@@ -3226,7 +3911,7 @@ mod tests {
         }
 
         // Widen the window and the same phrase fits without clipping.
-        let (wide, cut) = flow("THE CITY NEVER REALLY SLEEPS", 200, 4, true);
+        let (wide, cut) = flow("THE CITY NEVER REALLY SLEEPS", 200, 4, true, 1);
         assert!(!cut, "fits on one line when there is room");
         assert_eq!(wide.len(), 1);
         for l in &wide {
@@ -3238,12 +3923,12 @@ mod tests {
     /// wraps far later -- the wrap has to agree with that.
     #[test]
     fn flow_measures_the_terminal_font_in_cells() {
-        let (lines, cut) = flow("THE CITY NEVER REALLY SLEEPS", 40, 4, false);
+        let (lines, cut) = flow("THE CITY NEVER REALLY SLEEPS", 40, 4, false, 1);
         assert!(!cut);
         assert_eq!(lines.len(), 1, "27 characters still fit on one 40-cell row");
         for l in &lines {
-            let w: usize = l.iter().map(|x| x.chars().count()).sum::<usize>()
-                + l.len().saturating_sub(1);
+            let w: usize =
+                l.iter().map(|x| x.chars().count()).sum::<usize>() + l.len().saturating_sub(1);
             assert!(w <= 40, "line fits: {l:?}");
         }
     }
@@ -3332,7 +4017,10 @@ mod tests {
         crate::view::draw(&mut e, &mut o);
         let (bar_row, _) = e.hud_block.expect("the bar fits on a nine-row window");
         let (x, y) = e.origin();
-        assert!(y + e.block_size().1 <= bar_row, "the words sit above the bar");
+        assert!(
+            y + e.block_size().1 <= bar_row,
+            "the words sit above the bar"
+        );
         assert!(x + e.block_width() <= 80, "and inside the window");
     }
 
@@ -3453,7 +4141,10 @@ mod tests {
 
         let frame = String::from_utf8_lossy(&o2.0);
         let wipe = format!("\x1b[{};{}H\x1b[48;2;4;7;12m", y + 1, x + 1);
-        assert!(frame.contains(&wipe), "the boot band is wiped back to page bg");
+        assert!(
+            frame.contains(&wipe),
+            "the boot band is wiped back to page bg"
+        );
         assert!(
             !frame.contains("INITIALISING"),
             "and the words are not drawn over a stranded boot bar"
@@ -3531,7 +4222,10 @@ mod tests {
         e.label_row = true;
         e.set_now(0, 0);
         e.start_deadline(Deadline::at("RELEASE DAY", 2027, 3, 4, 9, 30, 0));
-        assert_eq!(e.label_text().as_deref(), Some("RELEASE DAY · 2027-03-04 09:30"));
+        assert_eq!(
+            e.label_text().as_deref(),
+            Some("RELEASE DAY · 2027-03-04 09:30")
+        );
     }
 
     #[test]
@@ -3564,7 +4258,11 @@ mod tests {
         e.key(b't');
         assert_eq!(e.mode, Mode::Clock);
         e.key(b't');
-        assert_eq!(e.mode, Mode::Todo, "nothing to count down to, so no stop there");
+        assert_eq!(
+            e.mode,
+            Mode::Todo,
+            "nothing to count down to, so no stop there"
+        );
         e.key(b't');
         assert_eq!(e.mode, Mode::Plan);
         e.key(b't');
@@ -3616,8 +4314,198 @@ mod tests {
         e.key(b'm');
         // Three selectable rows: WORDS, CLOCK, END OF YEAR.
         e.key(b'3');
-        assert_eq!(e.mode, Mode::Deadline, "three is the third that opens, not the third row");
+        assert_eq!(
+            e.mode,
+            Mode::Deadline,
+            "three is the third that opens, not the third row"
+        );
         assert!(!e.menu_open);
+    }
+
+    /// The built-in menu is a small set of pages, not one long list. Opening
+    /// it starts on the map, a page row opens that page, and escape walks back
+    /// down the stack before it finally closes the menu.
+    #[test]
+    fn the_auto_menu_browses_pages_and_applies_a_theme() {
+        let mut e = eng(80, 24);
+        e.set_now(0, 0);
+        e.year = Some(due(1000));
+        e.open_menu();
+
+        assert!(e.auto_menu, "the engine's own menu is the default");
+        assert_eq!(e.menu_stack, vec![MenuPage::Main]);
+        assert!(
+            e.menu
+                .iter()
+                .any(|i| i.label == "APPEARANCE  ·  THEME, FONT, COLOURS"),
+            "the main page is a map to the settings pages"
+        );
+
+        let appearance = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Page(MenuPage::Appearance))
+            .expect("the appearance page has a row");
+        e.menu_sel = appearance;
+        e.key(b'\n');
+        assert_eq!(e.menu_stack.last(), Some(&MenuPage::Appearance));
+        assert!(
+            e.menu
+                .iter()
+                .any(|i| i.kind == MenuKind::Theme(Theme::Amber)),
+            "every built-in theme is offered"
+        );
+
+        let amber = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Theme(Theme::Amber))
+            .expect("the amber row");
+        e.menu_sel = amber;
+        e.key(b'\n');
+        assert_eq!(e.theme, Theme::Amber);
+        assert_eq!(e.palette, Theme::Amber.palette());
+        assert!(e.settings_dirty, "the choice is waiting to be written");
+
+        e.key(0x1b);
+        assert_eq!(e.menu_stack.last(), Some(&MenuPage::Main));
+        assert!(e.menu_open, "one escape only goes back a page");
+        e.key(0x1b);
+        assert!(!e.menu_open, "and the next closes the menu");
+    }
+
+    #[test]
+    fn the_colour_page_opens_a_form_that_sets_and_resets_a_role() {
+        use crate::settings::ColorRole;
+
+        let mut e = eng(100, 30);
+        e.open_menu();
+        let appearance = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Page(MenuPage::Appearance))
+            .unwrap();
+        e.menu_sel = appearance;
+        e.key(b'\n');
+        let colours = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Page(MenuPage::Colors))
+            .unwrap();
+        e.menu_sel = colours;
+        e.key(b'\n');
+        assert_eq!(e.menu_stack.last(), Some(&MenuPage::Colors));
+
+        let accent = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Color(ColorRole::Accent))
+            .unwrap();
+        e.menu_sel = accent;
+        e.key(b'\n');
+        let form = e.color_form.as_ref().expect("the role opens its field");
+        assert_eq!(form.role, ColorRole::Accent);
+        assert!(form.text.is_empty(), "empty means go back to the theme");
+
+        for c in b"1,2,3" {
+            e.key(*c);
+        }
+        e.key(b'\n');
+        assert!(e.color_form.is_none());
+        assert_eq!(e.custom.accent, Some([1, 2, 3]));
+        assert_eq!(e.palette.accent, [1, 2, 3]);
+        assert!(e.settings_dirty);
+        assert!(e.menu_open, "the menu is still under the form");
+
+        let accent = e
+            .menu
+            .iter()
+            .position(|i| i.kind == MenuKind::Color(ColorRole::Accent))
+            .unwrap();
+        e.menu_sel = accent;
+        e.key(b'\n');
+        e.key(b'\n');
+        assert_eq!(e.custom.accent, None, "an empty field resets the role");
+        assert_eq!(e.palette.accent, Theme::Cyberpunk.palette().accent);
+    }
+
+    #[test]
+    fn choosing_a_theme_drops_the_custom_colours_over_it() {
+        use crate::settings::ColorRole;
+
+        let mut e = eng(80, 24);
+        e.set_color(ColorRole::Accent, Some([1, 2, 3]));
+        assert!(e.custom.any());
+        e.set_theme(Theme::Matrix);
+        assert!(!e.custom.any(), "a theme is a complete look, not a base");
+        assert_eq!(e.palette, Theme::Matrix.palette());
+
+        e.set_color(ColorRole::Text, Some([9, 9, 9]));
+        e.set_theme(Theme::Matrix);
+        assert!(
+            !e.custom.any(),
+            "re-choosing the theme in force also clears overrides"
+        );
+        assert_eq!(e.palette, Theme::Matrix.palette());
+    }
+
+    #[test]
+    fn a_wider_font_is_wider_without_getting_taller() {
+        let mut e = pixel_eng(200, 30);
+        e.font_width = 1;
+        e.use_phrases(vec!["WAKE UP".into()]);
+        let (narrow_w, narrow_h) = (e.block_width(), e.block_size().1);
+        let narrow_glyph = e.glyphs[0].w;
+
+        e.set_font_width(2);
+        assert_eq!(e.font_width, 2);
+        assert_eq!(e.glyphs[0].w, narrow_glyph * 2, "source columns repeat");
+        assert!(e.block_width() > narrow_w, "the line gets wider");
+        assert_eq!(e.block_size().1, narrow_h, "but no taller");
+        assert!(e.settings_dirty);
+
+        e.set_font_width(3);
+        assert_eq!(e.glyphs[0].w, narrow_glyph * 3);
+        e.set_font_width(9);
+        assert_eq!(
+            e.font_width,
+            settings::MAX_FONT_WIDTH,
+            "clamped, not refused"
+        );
+    }
+
+    #[test]
+    fn the_settings_snapshot_carries_every_visual_preference() {
+        use crate::settings::ColorRole;
+
+        let mut e = pixel_eng(80, 24);
+        e.set_theme(Theme::Matrix);
+        e.set_color(ColorRole::Success, Some([7, 8, 9]));
+        e.set_font_width(3);
+        e.set_words_pixel(true);
+        e.set_pin(true);
+        e.set_level(61.5);
+        let saved = e.settings();
+        assert_eq!(saved.theme, Theme::Matrix);
+        assert_eq!(saved.custom.success, Some([7, 8, 9]));
+        assert_eq!(saved.font_width, 3);
+        assert!(saved.pixel_font);
+        assert!(saved.pin);
+        assert!((saved.level - 61.5).abs() < 1e-9);
+
+        let mut fresh = eng(80, 24);
+        fresh.apply_settings(&saved);
+        assert_eq!(fresh.settings(), saved);
+        assert_eq!(fresh.palette, saved.palette());
+        assert!(fresh.pixel, "the words start in their remembered font");
+        assert!(
+            !fresh.settings_dirty,
+            "a load is not a change to write back"
+        );
+        assert!(
+            fresh.page_dirty,
+            "the frame loop repaints the new background"
+        );
     }
 
     #[test]
@@ -3635,7 +4523,10 @@ mod tests {
 
         e.key(b'm');
         e.key(b'x');
-        assert!(matches!(e.key(b'x'), Action::None), "on WORDS, x does nothing");
+        assert!(
+            matches!(e.key(b'x'), Action::None),
+            "on WORDS, x does nothing"
+        );
 
         e.key(b'j');
         assert_eq!(e.menu_sel, 3, "down onto the saved deadline");
@@ -3644,7 +4535,8 @@ mod tests {
             Action::Forget(i) => assert_eq!(i, 0, "the caller is told which one"),
             _ => panic!("x on a deadline should hand back a deletion"),
         }
-        assert!(!e.menu_open, "and close the picker");    }
+        assert!(!e.menu_open, "and close the menu");
+    }
 
     #[test]
     fn the_add_row_opens_the_form_and_the_form_saves_a_deadline() {
@@ -3661,7 +4553,7 @@ mod tests {
         assert_eq!(f.field, 0);
         assert_eq!(f.date, "1970-01-02", "tomorrow, from the reading in");
         assert_eq!(f.time, "23:59");
-        assert!(!e.menu_open, "and the picker gets out of the way");
+        assert!(!e.menu_open, "and the menu gets out of the way");
 
         // Type a name, then a date straight over the placeholder the form
         // opened with -- no rubbing out first.
@@ -3726,7 +4618,11 @@ mod tests {
         // The date and the time take the characters a stamp is made of.
         e.key(b'\t');
         e.key(b'q');
-        assert_eq!(e.form.as_ref().unwrap().date, "1970-01-02", "a letter is refused");
+        assert_eq!(
+            e.form.as_ref().unwrap().date,
+            "1970-01-02",
+            "a letter is refused"
+        );
         e.key(0x7f);
         e.key(0x7f);
         e.key(0x7f);
@@ -3774,8 +4670,16 @@ mod tests {
         e2.key(b'\n');
         e2.key(b'\t');
         e2.key(b'\t');
-        assert_eq!(e2.form.as_ref().unwrap().date, "1970-01-02", "untouched keeps it");
-        assert_eq!(e2.form.as_ref().unwrap().time, "23:59", "untouched keeps it");
+        assert_eq!(
+            e2.form.as_ref().unwrap().date,
+            "1970-01-02",
+            "untouched keeps it"
+        );
+        assert_eq!(
+            e2.form.as_ref().unwrap().time,
+            "23:59",
+            "untouched keeps it"
+        );
     }
 
     #[test]
@@ -3793,7 +4697,10 @@ mod tests {
         e.key(b't'); // Timer -> Clock
         e.key(b't'); // Clock -> Deadline (the year)
         assert_eq!(e.mode, Mode::Deadline);
-        assert_eq!(e.text, "00:00:40", "the reading is current, not from before");
+        assert_eq!(
+            e.text, "00:00:40",
+            "the reading is current, not from before"
+        );
     }
 
     // -- the todo list -------------------------------------------------------
@@ -3886,7 +4793,10 @@ mod tests {
 
         e.start_todo();
         run(&mut e, 5.0);
-        assert_eq!(e.elapsed, session, "the session clock stops in the todo list");
+        assert_eq!(
+            e.elapsed, session,
+            "the session clock stops in the todo list"
+        );
         assert_eq!(e.timer.value, left, "and the countdown does not run on");
 
         e.key(b't'); // Todo -> Plan
@@ -3913,7 +4823,10 @@ mod tests {
         e.key(b'a');
         let f = e.plan_form.clone().expect("a opens the event form");
         assert_eq!(f.field, 0);
-        assert_eq!(f.start, "00:15", "the next quarter hour, from the reading in");
+        assert_eq!(
+            f.start, "00:15",
+            "the next quarter hour, from the reading in"
+        );
         assert_eq!(f.end, "01:15");
 
         for c in b"standup" {
@@ -4006,11 +4919,18 @@ mod tests {
         e.start_plan();
         run(&mut e, BOOT_TIME + 0.1);
         assert_eq!(e.mode, Mode::Plan);
-        assert_eq!(e.phase, Phase::Running, "the boot hands over to the planner");
-        assert!(!e.pixel, "the planner never switches the words to the big font");
-        assert!(e.overlay_up(), "ambient glitches stay parked under a workspace");
+        assert_eq!(
+            e.phase,
+            Phase::Running,
+            "the boot hands over to the planner"
+        );
+        assert!(
+            !e.pixel,
+            "the planner never switches the words to the big font"
+        );
+        assert!(
+            e.overlay_up(),
+            "ambient glitches stay parked under a workspace"
+        );
     }
 }
-
-
-

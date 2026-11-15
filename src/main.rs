@@ -10,6 +10,7 @@ mod engine;
 mod font;
 mod phrases;
 mod plan;
+mod settings;
 mod style;
 mod term;
 mod time;
@@ -23,7 +24,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const PAGE_BG: style::Rgb = style::BG;
 const FRAME: Duration = Duration::from_micros(16_666); // 60fps ceiling
 
 /// Phrase file picked up from the working directory when `--words` is absent.
@@ -62,7 +62,7 @@ struct Args {
     timer: Option<(bool, f64)>,
     /// Start on the wall clock.
     clock: bool,
-    /// Open the picker at startup.
+    /// Open the menu at startup.
     menu: bool,
     /// Start on the todo list.
     todo: bool,
@@ -99,7 +99,11 @@ fn parse() -> Result<Args, String> {
     };
     // Peekable so `--timer` can take a value or stand alone, the way `ps` and
     // friends do.
-    let mut it = std::env::args().skip(1).collect::<Vec<_>>().into_iter().peekable();
+    let mut it = std::env::args()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => a.help = true,
@@ -160,7 +164,7 @@ fn usage() {
     -i, --stdin         also read phrases from a pipe
     -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
     -k, --clock         start on the wall clock
-    -m, --menu          open the picker at startup
+    -m, --menu          open the menu at startup
         --todo          start on the todo list
         --plan          start on the day planner
     -l, --list          print the built-in phrases and exit
@@ -168,7 +172,7 @@ fn usage() {
 
   MODES
     There are six things this program can be. `T` walks between them, or
-    press `M` for the picker and choose one directly:
+    press `M` for the menu and choose one directly:
 
         WORDS     the typewriter
         COUNTER   a countdown or a stopwatch
@@ -177,6 +181,23 @@ fn usage() {
         TODO      a little list of things to do
         PLANNER   a day of blocks with a start and an end
 
+  MENU
+    `M` opens a page-based menu. Up/down move, enter opens a row or page,
+    escape goes back one page (and closes from the main page). The main page
+    has the modes, deadlines, phrase files, and two settings pages:
+
+        APPEARANCE  theme, pixel font, font width, pinned bar, custom colours
+        CONFIG      where the files live, and the typing speed
+
+    Themes are CYBERPUNK, AMBER, and MATRIX GREEN. Custom colours accept
+    `#RRGGBB`, `RRGGBB`, `R,G,B`, or `R G B`; an empty field restores that
+    role to the theme. Font width 1, 2, or 3 changes only how wide the pixel
+    font is, never how tall.
+
+    Preferences are remembered in:
+
+        {dir}/settings
+
   COUNTER
         words --timer          a 25:00 countdown, armed and waiting
         words --timer 90       a minute and a half
@@ -184,7 +205,7 @@ fn usage() {
         words --timer down     the 25:00 countdown again
 
   DEADLINES
-    `M` opens the picker, where the turn of the year is always the first
+    `M` opens the menu, where the turn of the year is always the first
     deadline (with how much of the year has gone), then your own, soonest
     first. On a deadline row:
 
@@ -242,7 +263,7 @@ fn usage() {
   KEYS (while running)
     W / ↑    faster      S / ↓    slower
     SPACE     next phrase         ← →     previous / next
-    F         font                R       auto-ramp speed
+    F         pixel font          R       auto-ramp speed
     G         force a glitch      B       pin the control bar
     T         next mode           M       open the menu
     H  ?      controls            Q       quit
@@ -250,11 +271,11 @@ fn usage() {
   KEYS (on the counter)
     SPACE / P run · pause · resume    C   clear back to the start
     U         count down / count up   +/- lengthen / shorten the run
-    F  font   G  glitch   B  pin      T   next mode
+    F  pixel font   G  glitch   B  pin      T   next mode
     M  menu   H / ?  controls         Q   quit
 
   KEYS (on the clock)
-    F  font   G  glitch   B  pin      M   open the menu
+    F  pixel font   G  glitch   B  pin      M   open the menu
     T  next mode   H / ?  controls    Q   quit
 
   KEYS (on the todo list)
@@ -304,6 +325,15 @@ fn main() {
         }
     };
 
+    // Preferences are read before the terminal is taken over too: a missing or
+    // malformed settings file is simply the defaults, but keeping the read here
+    // means it can never be interleaved with the first frame.
+    let settings_path = config::settings_file();
+    let saved = settings_path
+        .as_ref()
+        .map(|p| settings::load(p))
+        .unwrap_or_default();
+
     let mut tty = match term::Term::enter() {
         Ok(t) => t,
         Err(e) => {
@@ -314,6 +344,7 @@ fn main() {
 
     let (cols, rows) = tty.size();
     let mut e = engine::Engine::new(args.seed, cols, rows);
+    e.apply_settings(&saved);
     if !sources.sections.is_empty() {
         e.use_sections(&sources.sections);
     }
@@ -334,7 +365,7 @@ fn main() {
     let local = time::utc_now() + offset;
     e.set_now(local - offset, offset);
 
-    // Saved deadlines, and the turn of the year -- always on the picker, so
+    // Saved deadlines, and the turn of the year -- always on the menu, so
     // "how much of the year is left" is a countdown like any other.
     let mut deadlines = config::deadlines_file()
         .map(|p| deadline::load(&p, offset))
@@ -354,7 +385,10 @@ fn main() {
     e.todos = todos.clone();
     e.plan = plan.clone();
 
-    e.set_menu(menu_items(&deadlines, e.year.as_ref(), local, offset));
+    // Make sure the directory the menu reads from exists to be dropped into,
+    // then hand the engine the phrase files it offers on its main page.
+    let _ = config::ensure_dir();
+    e.set_phrase_files(config::phrase_files());
     if args.todo {
         e.start_todo();
     }
@@ -364,8 +398,6 @@ fn main() {
     if args.menu {
         e.open_menu();
     }
-    // Make sure the directory the menu reads from exists to be dropped into.
-    let _ = config::ensure_dir();
 
     // --- input ---------------------------------------------------------------
     let (tx, rx) = mpsc::channel::<u8>();
@@ -373,7 +405,8 @@ fn main() {
 
     // --- frame loop ----------------------------------------------------------
     let mut out = term::Out::new();
-    out.put(&paint_page());
+    out.put(&paint_page(e.palette.bg));
+    e.page_dirty = false;
     let _ = out.flush();
 
     let mut last = Instant::now();
@@ -399,13 +432,14 @@ fn main() {
             }
         }
 
-        // The picker is rebuilt every time it comes up, so a file dropped into
+        // The menu is rebuilt every time it comes up, so a file dropped into
         // the config directory while we were running is there to choose -- and
-        // so the countdowns on the deadline rows are counted afresh.
+        // so the countdowns on the deadline rows are counted afresh. The engine
+        // generates the pages; the caller only supplies the state they read.
         if e.menu_open && !menu_was_open {
-            let local = time::utc_now() + offset;
             e.deadlines = deadlines.clone();
-            e.set_menu(menu_items(&deadlines, e.year.as_ref(), local, offset));
+            e.set_phrase_files(config::phrase_files());
+            e.refresh_menu();
         }
         menu_was_open = e.menu_open;
 
@@ -417,6 +451,17 @@ fn main() {
         e.update(dt);
         let (c, r) = tty.size();
         e.resize(c, r);
+
+        // A preference changed on the menu is written on the next frame, once,
+        // rather than on every frame the menu happens to be open. With no
+        // config directory there is nowhere to write it, but the change still
+        // holds for this session.
+        if e.settings_dirty {
+            if let Some(path) = &settings_path {
+                let _ = settings::save(path, &e.settings());
+            }
+            e.settings_dirty = false;
+        }
 
         // The wall clock needs a reading several times a second so the visible
         // second lands near the real one. The offset behind it is re-read far
@@ -442,7 +487,15 @@ fn main() {
         }
 
         out.clear();
-        out.put("\x1b[H");
+        // A custom or theme background has to repaint the whole page, not just
+        // the cells the words and chrome happen to own; otherwise the old
+        // colour survives in the margins.
+        if e.page_dirty {
+            out.put(&paint_page(e.palette.bg));
+            e.page_dirty = false;
+        } else {
+            out.put("\x1b[H");
+        }
         view::chrome(&e, &mut out, c as usize, r as usize);
         view::draw(&mut e, &mut out);
         // The bell rides along in the frame's own write, so a countdown that
@@ -460,65 +513,15 @@ fn main() {
         }
     }
 
-    tty.restore();
-}
-
-/// The rows of the picker, in sections: the modes; the deadlines (the turn of
-/// the year first, then the saved ones soonest first, then the row that adds
-/// one); and every phrase file under the config directory, in name order.
-///
-/// `local` and `offset` are what turn the moments into countdowns: the row
-/// shows how long each one has left, so the picker answers the question
-/// before it is asked.
-fn menu_items(
-    deadlines: &[deadline::Deadline],
-    year: Option<&deadline::Deadline>,
-    local: i64,
-    offset: i64,
-) -> Vec<engine::MenuItem> {
-    use engine::{MenuKind, MenuItem};
-
-    let utc = local - offset;
-    let mut items = vec![
-        MenuItem::new("MODES", MenuKind::Head),
-        MenuItem::new("WORDS", MenuKind::Words),
-        MenuItem::new("COUNTER", MenuKind::Counter),
-        MenuItem::new("CLOCK", MenuKind::Clock),
-        MenuItem::new("TODO", MenuKind::Todo),
-        MenuItem::new("PLANNER", MenuKind::Plan),
-        MenuItem::new("DEADLINES", MenuKind::Head),
-    ];
-
-    // The year is a deadline everyone has, and its row carries the two
-    // answers about it: how much of the year has gone, and how long there is
-    // left.
-    if let Some(_y) = year {
-        let (pct, left) = time::year_stats(local);
-        items.push(MenuItem::new(
-            format!(
-                "END OF YEAR  ·  {pct:.1}% GONE  ·  {}",
-                deadline::short(left)
-            ),
-            MenuKind::Year,
-        ));
-    }
-    for (i, d) in deadlines.iter().enumerate() {
-        items.push(MenuItem::new(
-            format!("{}  ·  {}", d.name, deadline::short(d.at - utc)),
-            MenuKind::Deadline(i),
-        ));
-    }
-    items.push(MenuItem::new("+ ADD A DEADLINE", MenuKind::Add));
-
-    let files = config::phrase_files();
-    if !files.is_empty() {
-        items.push(MenuItem::new("PHRASES", MenuKind::Head));
-        for path in files {
-            let label = config::label(&path);
-            items.push(MenuItem::new(label, MenuKind::File(path)));
+    // A key that changes a preference and quits in the same batch still gets
+    // its setting written before the terminal is handed back.
+    if e.settings_dirty {
+        if let Some(path) = &settings_path {
+            let _ = settings::save(path, &e.settings());
         }
     }
-    items
+
+    tty.restore();
 }
 
 /// The turn of the next year, as a deadline that is always there.
@@ -561,7 +564,7 @@ fn add_deadline(
     deadlines.sort_by_key(|d| d.at);
     store_deadlines(deadlines);
     e.deadlines = deadlines.clone();
-    e.set_menu(menu_items(deadlines, e.year.as_ref(), e.local, e.local - e.utc));
+    e.refresh_menu();
     e.start_deadline(d);
     e.notice = Some(("SAVED".to_string(), 2.5));
 }
@@ -576,7 +579,7 @@ fn forget_deadline(e: &mut engine::Engine, deadlines: &mut Vec<deadline::Deadlin
     let gone = deadlines.remove(i);
     store_deadlines(deadlines);
     e.deadlines = deadlines.clone();
-    e.set_menu(menu_items(deadlines, e.year.as_ref(), e.local, e.local - e.utc));
+    e.refresh_menu();
     let shown = e
         .target
         .as_ref()
@@ -593,11 +596,7 @@ fn forget_deadline(e: &mut engine::Engine, deadlines: &mut Vec<deadline::Deadlin
 /// Load a phrase file chosen from the menu, put it on screen, and start
 /// watching it so later edits show up live -- the same treatment `--words`
 /// gets.
-fn open_phrases(
-    e: &mut engine::Engine,
-    watch: &mut Option<Watch>,
-    path: &Path,
-) {
+fn open_phrases(e: &mut engine::Engine, watch: &mut Option<Watch>, path: &Path) {
     match read_file(path) {
         Ok(secs) if !secs.is_empty() => {
             e.show(&secs);
@@ -628,7 +627,9 @@ fn resolve(args: &Args) -> Result<Sources, String> {
         other => (args.stdin, other.map(PathBuf::from)),
     };
     let words = words.or_else(|| {
-        Path::new(DEFAULT_WORDS).is_file().then(|| PathBuf::from(DEFAULT_WORDS))
+        Path::new(DEFAULT_WORDS)
+            .is_file()
+            .then(|| PathBuf::from(DEFAULT_WORDS))
     });
 
     let custom = want_stdin || words.is_some();
@@ -694,7 +695,10 @@ fn read_source(path: &Path) -> Result<(Vec<phrases::Section>, bool), String> {
         .collect();
     names.sort();
     if names.is_empty() {
-        return Err(format!("{}: no .txt files in that directory", path.display()));
+        return Err(format!(
+            "{}: no .txt files in that directory",
+            path.display()
+        ));
     }
     let mut out = Vec::new();
     for p in &names {
@@ -800,10 +804,10 @@ fn total(secs: &[phrases::Section]) -> usize {
 
 /// Fill the page with our own background so the bezel and rules have something
 /// to sit on, instead of whatever colour the user's profile used.
-fn paint_page() -> String {
+fn paint_page(bg: style::Rgb) -> String {
     format!(
         "\x1b[48;2;{};{};{}m\x1b[38;2;{};{};{}m\x1b[2J\x1b[H",
-        PAGE_BG[0], PAGE_BG[1], PAGE_BG[2], PAGE_BG[0], PAGE_BG[1], PAGE_BG[2]
+        bg[0], bg[1], bg[2], bg[0], bg[1], bg[2]
     )
 }
 

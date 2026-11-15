@@ -70,7 +70,7 @@ pub fn deadlines_file() -> Option<PathBuf> {
 }
 
 /// The file the todo list lives in. Not a `.txt` for the same reason as the
-/// deadline file: the phrase picker offers every `.txt` in the directory.
+/// deadline file: the phrase menu offers every `.txt` in the directory.
 pub fn todos_file() -> Option<PathBuf> {
     dir().map(|d| d.join("todos"))
 }
@@ -78,6 +78,12 @@ pub fn todos_file() -> Option<PathBuf> {
 /// The file the day planner lives in.
 pub fn plan_file() -> Option<PathBuf> {
     dir().map(|d| d.join("plan"))
+}
+
+/// Where preferences and custom colours are remembered. Plain text like the
+/// rest of the config directory, so it can be edited by hand.
+pub fn settings_file() -> Option<PathBuf> {
+    dir().map(|d| d.join("settings"))
 }
 
 #[cfg(test)]

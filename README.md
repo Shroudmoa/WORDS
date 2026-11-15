@@ -6,7 +6,12 @@ them for a beat, then moves on — with glitch bursts tearing through the text.
 
 It is also a countdown/stopwatch, a wall clock, a deadline tracker, a little
 todo list, and a day planner drawn as a small Gantt chart. `T` walks between
-the modes, or open the picker and choose one directly.
+the modes, or open the menu and choose one directly.
+
+Three looks ship with it — Cyberpunk, Amber, and Matrix Green — and the main
+colours can be overridden with any RGB or hex value. The pixel font can be
+made narrower or wider without changing its height, and those choices are
+remembered between runs.
 
 Zero dependencies. It is raw ANSI escape codes and a 5×7 bitmap font, so it
 builds in seconds and runs anywhere with a terminal.
@@ -38,7 +43,7 @@ POSIX-only — Linux, macOS, and the BSDs. Nothing else is needed.
 -i, --stdin         also read phrases from a pipe
 -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
 -k, --clock         start on the wall clock
--m, --menu          open the picker at startup
+-m, --menu          open the menu at startup
     --todo          start on the todo list
     --plan          start on the day planner
 -l, --list          print the built-in phrases and exit
@@ -53,10 +58,11 @@ letters. A `--lang` set is a starting point that custom sources add to rather
 than replace.
 
 Anything dropped in `$XDG_CONFIG_HOME/words` (or `~/.config/words`) — every
-`.txt` file there, by its name — shows up on the picker, so prose can be kept
+`.txt` file there, by its name — shows up on the menu, so prose can be kept
 handy without naming it on the command line. Saved deadlines share the
 directory in a file called `deadlines`; the todo list and the planner use
-`todos` and `plan`. None of them are `.txt`, so they stay off the phrase list.
+`todos` and `plan`, and preferences live in `settings`. None of them are
+`.txt`, so they stay off the phrase list.
 
 ## Modes
 
@@ -74,9 +80,44 @@ the typewriter is what you get. On the `CLOCK` the date sits under the digits
 (`MON 2026-10-12`) and a moving head sweeps the control bar, because a wall
 clock has no start or finish to fill toward.
 
+## Appearance and settings
+
+The menu is the way in. `M` opens a small page-based menu — the main page is
+the map, and `APPEARANCE` holds the visual choices:
+
+- **THEME** switches between `CYBERPUNK`, `AMBER`, and `MATRIX GREEN`. Choosing
+  one also drops any custom colours, so a theme is always a complete look.
+- **PIXEL FONT** turns the big 5×7 bitmap on or off for the words. The clock
+  and deadlines always use it, whatever the words are set to. The normal
+  terminal font stays one cell per character and is not affected by the width.
+- **FONT WIDTH** sets how many terminal cells each source column takes:
+  `1` narrow, `2` wide (the default), `3` widest. It changes width only — the
+  glyphs do not get taller, and wrapping, centring, spacing, and the glitch
+  effects follow the new width.
+- **PIN THE BAR** keeps the control bar on screen instead of fading it.
+- **CUSTOM COLOURS** opens a colour page. Pick a role — background, text,
+  accent, secondary, alert, or success — and type `#00E5FF`, `00E5FF`,
+  `0, 229, 255`, or `0 229 255`. An empty field restores that role to the
+  theme. `RESET TO THEME COLOURS` clears every override at once.
+
+The `CONFIG` page shows where the files live and offers the speed control.
+Preferences are written to `~/.config/words/settings` as soon as they change:
+
+```text
+theme = cyberpunk
+font_width = 2
+pixel_font = false
+pin = false
+level = 34.00
+```
+
+Any custom colours follow as `bg = #04070c` lines. A missing file is simply
+the defaults; an unreadable value is ignored rather than stopping the program,
+so the file is safe to edit by hand.
+
 ## Deadlines
 
-The picker (`M`) has a `DEADLINES` section. `END OF YEAR` is always there — it
+The menu (`M`) has a `DEADLINES` section. `END OF YEAR` is always there — it
 counts down to the turn of the year and shows how much of it has gone
 (`END OF YEAR · 48.2% GONE · 137d 11:22`) — and below it are the deadlines
 you've saved, soonest first, each with its own countdown. Choosing a row makes
@@ -99,13 +140,13 @@ way a countdown does, and the strip under the digits names what it is counting
 to. On the `CLOCK` the caption carries the year too (`THU 2026-10-20 · 80.0%
 GONE`), so the two answers about the year are always a glance away.
 
-To remove a deadline, highlight it in the picker and press `X`. It is taken off
+To remove a deadline, highlight it in the menu and press `X`. It is taken off
 the list and the file is written back. (`X` on any other row does nothing — it
 will not delete a phrase file.)
 
 ## Todo
 
-`--todo`, the picker, or `T` gets you to a small todo list. It is one task per
+`--todo`, the menu, or `T` gets you to a small todo list. It is one task per
 line with a checkbox:
 
 - `UP`/`DOWN` (or `J`/`K`) move through the list.
@@ -129,7 +170,7 @@ task is skipped rather than refusing the rest.
 
 ## Planner
 
-`--plan`, the picker, or `T` opens a day planner. Events have a name, a date, a
+`--plan`, the menu, or `T` opens a day planner. Events have a name, a date, a
 start and an end, and the day is drawn as a small Gantt chart: one row per
 event, with the 24-hour day running left to right and each event a bar from its
 start to its end. A magenta marker shows where "now" is when the day on screen
@@ -162,12 +203,12 @@ The planner sorts by day and start time, and only draws the day it is showing.
 | `S` / `↓` | slower |
 | `SPACE` | next phrase |
 | `←` / `→` | previous / next |
-| `F` | font size (big ⇄ small) |
+| `F` | pixel font on / off for the words |
 | `R` | auto-ramp the speed |
 | `G` | force a glitch |
 | `B` | pin the control bar |
 | `T` | next mode |
-| `M` | open the picker |
+| `M` | open the menu |
 | `H` / `?` | controls |
 | `Q` | quit |
 
@@ -176,11 +217,13 @@ On the counter, `SPACE`/`P` run, pause and resume, `C` clears back to the start,
 shorten the run. The wall clock has no controls of its own: it is always
 running.
 
-In the picker, `↑`/`↓` (or `W`/`S`, `K`/`J`) move, `ENTER` chooses, a digit
-jumps straight to that row, `X` deletes the highlighted deadline, and `M` or
-`ESC` closes it. Section headings (`MODES`, `DEADLINES`, `PHRASES`) are labels,
-not rows — navigation steps over them and the digit shortcuts count only the
-rows you can act on.
+In the menu, `↑`/`↓` (or `W`/`S`, `K`/`J`) move, `ENTER` opens the
+highlighted row or page, a digit jumps straight to a row, and `X` deletes the
+highlighted deadline. `ESC` goes back one page — and closes the menu from the
+main page. `M` closes it outright. Section headings (`MODES`, `THEME`,
+`PIXEL FONT`, `DEADLINES`, `PHRASES`) are labels, not rows: navigation steps
+over them and the digit shortcuts count only rows you can act on. A `●` marks
+the theme, font, or pin setting currently in force.
 
 ## How it behaves
 
@@ -200,8 +243,9 @@ font affordable at 60 fps with no libraries.
 
 **Layout adapts to the window.** Phrases word-wrap, each line is centred
 individually so a wrapped sentence reads as one block, and the font drops a size
-rather than truncating. On a window too short for the chrome, the chrome gives
-way — a line of text always fits.
+rather than truncating. The pixel font's horizontal scale is independent of its
+height, so making it wider costs columns, not rows. On a window too short for
+the chrome, the chrome gives way — a line of text always fits.
 
 **Every painter wipes its own footprint.** A terminal keeps whatever the last
 frame left in a cell, so a glitch burst, the control bar fading out, and the
@@ -213,16 +257,17 @@ following frame, so torn pixels never linger.
 
 ```
 src/main.rs     CLI, frame loop, key reader thread
-src/engine.rs   state machine, layout, speed model, tests
+src/engine.rs   state machine, layout, speed model, menu, tests
 src/view.rs     everything that draws
-src/style.rs    palette, colour mixing, run-coalescing canvas
+src/settings.rs themes' text file, custom colours, load/save
+src/style.rs    themes, palette, colour mixing, run-coalescing canvas
 src/font.rs     5x7 glyphs
 src/phrases.rs  phrase pools and transliteration
 src/deadline.rs saved deadlines and the on-disk format
 src/todo.rs     saved todo list and the on-disk format
 src/plan.rs     saved planner events and the on-disk format
 src/time.rs     UTC offset, civil-date maths, the clock's strings
-src/config.rs   the ~/.config/words directory the picker reads
+src/config.rs   the ~/.config/words directory the menu reads
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 ```
 
@@ -232,13 +277,16 @@ src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 cargo test
 ```
 
-Unit tests cover centring, wrapping, the speed model, the three-second rule,
-the phrase transliteration, and the repaint bookkeeping that keeps stale pixels
-off the screen — alongside the counter, the wall clock's date arithmetic, the
-deadline file's round-trip, the year maths, and the picker's navigation and
-file selection. The todo list and the planner get the same treatment: their
-file formats round-trip, bad lines are skipped, tasks tick and clear, events
-add, edit, delete, sort, and refuse an end before their start.
+Unit tests cover centring, wrapping, the wider font's metrics, the speed
+model, the three-second rule, the phrase transliteration, and the repaint
+bookkeeping that keeps stale pixels off the screen — alongside the counter,
+the wall clock's date arithmetic, the deadline file's round-trip, the year
+maths, and the menu's page navigation and file selection. Settings round-trip
+through their file, bad values fall back to the defaults, and themes and custom
+colours resolve to the palette the painters use. The todo list and the planner
+get the same treatment: their file formats round-trip, bad lines are skipped,
+tasks tick and clear, events add, edit, delete, sort, and refuse an end before
+their start.
 
 ## Notes
 
