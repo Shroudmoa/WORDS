@@ -35,7 +35,11 @@ pub fn draw(r: &Reader, o: &mut Out, cols: usize, rows: usize) {
         .document()
         .map(|d| d.kind.label())
         .unwrap_or("----");
-    let tag = format!("{kind}  {} ", r.ui.label());
+    let tag = format!(
+        "{kind}  {}{} ",
+        r.ui.label(),
+        if r.voice.playing { "  \u{25b6} VOICE" } else { "" }
+    );
     write_text(o, cols, cols.saturating_sub(tag.chars().count() + 2), 0, &tag, cyan);
     style::cells(o, 1, 1, cols.saturating_sub(2), dim);
 
@@ -96,7 +100,11 @@ pub fn draw(r: &Reader, o: &mut Out, cols: usize, rows: usize) {
     } else if let Some(msg) = r.message() {
         write_text(o, cols, 2, prompt_row, msg, AMBER);
     } else {
-        let hint = "gg first · G last · ctrl-d/u/f/b scroll · H/M/L screen · zz center · n/N search · ctrl-h help";
+        let hint = if r.voice.playing {
+            "space pause · s stop · < > sentence · [ ] rate · V toggle voice"
+        } else {
+            "gg first · G last · ctrl-d/u/f/b scroll · H/M/L screen · space read aloud · ctrl-h help"
+        };
         write_text(o, cols, 2, prompt_row, hint, dim);
     }
 
@@ -136,6 +144,7 @@ fn draw_row(
     let line = &doc.lines[row.line];
     let text: Vec<char> = line.text.chars().collect();
     let hits = r.highlights(row.line);
+    let voice_span = r.spoken();
     let anchor = r.anchor.unwrap_or(r.cursor);
     let selected = if r.ui == super::Ui::Visual {
         Some((anchor.min(r.cursor), anchor.max(r.cursor)))
@@ -154,10 +163,13 @@ fn draw_row(
             (row.line > a.line || (row.line == a.line && i >= a.col))
                 && (row.line < b.line || (row.line == b.line && i < b.col))
         });
+        let in_voice = voice_span.is_some_and(|s| in_sentence(s, row.line, i));
         let bg = if in_hit {
             style::mix(BG, AMBER, 0.38)
         } else if in_sel {
             style::mix(BG, MAGENTA, 0.32)
+        } else if in_voice {
+            style::mix(BG, GREEN, 0.28)
         } else if on_cursor {
             style::mix(BG, CYAN, 0.22)
         } else {
@@ -180,6 +192,8 @@ fn draw_row(
                 style::mix(BG, AMBER, 0.38)
             } else if next_sel {
                 style::mix(BG, MAGENTA, 0.32)
+            } else if voice_span.is_some_and(|s| in_sentence(s, row.line, j)) {
+                style::mix(BG, GREEN, 0.28)
             } else if row.line == r.cursor.line && j == r.cursor.col {
                 style::mix(BG, CYAN, 0.22)
             } else {
@@ -198,6 +212,22 @@ fn draw_row(
     }
     // A text row can be shorter than the layout width; nothing to clear here
     // because the whole screen was wiped at the start of the frame.
+}
+
+/// Whether a char position falls inside the sentence being spoken. Both ends
+/// are exclusive/inclusive as stored: `start` is the first word, `end` is one
+/// past the last.
+fn in_sentence(s: &crate::voice::Sentence, line: usize, col: usize) -> bool {
+    if line < s.start.0 || line > s.end.0 {
+        return false;
+    }
+    if line == s.start.0 && col < s.start.1 {
+        return false;
+    }
+    if line == s.end.0 && col >= s.end.1 {
+        return false;
+    }
+    true
 }
 
 fn style_at(spans: &[super::document::Span], i: usize) -> TextStyle {
@@ -281,6 +311,9 @@ const HELP: &[(&str, &str)] = &[
     ("n · N", "next / previous match"),
     ("v · y", "start selection · copy it"),
     ("yy", "copy the current line"),
+    ("space", "read aloud / pause"),
+    ("s · < · >", "stop · prev / next sentence"),
+    ("[ · ] · V", "slower / faster · toggle voice"),
     (":e PATH", "open another document"),
     ("q · esc", "leave reader · cancel a prompt"),
 ];

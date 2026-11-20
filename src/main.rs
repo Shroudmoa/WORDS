@@ -16,6 +16,7 @@ mod term;
 mod time;
 mod todo;
 mod view;
+mod voice;
 
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -206,6 +207,27 @@ fn usage() {
     document, `:q` to leave and `:help` for the in-app key panel. The last
     position in each document is remembered under ~/.config/words/positions.
 
+   VOICE
+    Words speaks a new phrase as it appears, and Reader can read a document
+    aloud with the current sentence tinted as it goes. No audio library is
+    built in: it uses espeak-ng / espeak, say, spd-say or, failing those, a
+    Python gTTS fallback (with ffplay, mpg123, afplay or cvlc).
+    Settings live in:
+
+        {dir}/voice
+
+        enabled=true    master switch (v toggles it while running)
+        reader=true     speak documents in Reader Mode
+        words=true      speak each typewriter phrase
+        backend=auto    auto / espeak / say / spd-say / gtts / none
+        voice=          optional voice name or language
+        rate=175        words per minute
+        volume=100      percentage
+        lang=en         language code for gTTS
+
+    In Reader: space reads / pauses, s stops, < and > step a sentence,
+    [ and ] change speed, V toggles voice, and :rate N sets words per minute.
+
   COUNTER
         words --timer          a 25:00 countdown, armed and waiting
         words --timer 90       a minute and a half
@@ -274,7 +296,8 @@ fn usage() {
     F         font                R       auto-ramp speed
     G         force a glitch      B       pin the control bar
     T         next mode           M       open the menu
-    H  ?      controls            Q       quit
+    V         voice on/off        H  ?    controls
+    Q         quit
 
   KEYS (on the counter)
     SPACE / P run · pause · resume    C   clear back to the start
@@ -365,6 +388,9 @@ fn main() {
     // The config directory is where reading positions are kept; make sure it
     // exists before a document tries to restore one.
     let _ = config::ensure_dir();
+    // One worker for the typewriter's phrases; the reader owns its own so each
+    // mode can highlight what it is saying. Both read the same config file.
+    let mut voice = voice::Voice::new(voice::Config::load());
 
     let (cols, rows) = tty.size();
     let mut e = engine::Engine::new(args.seed, cols, rows);
@@ -443,11 +469,30 @@ fn main() {
     let mut last = Instant::now();
     let mut watched_at = Instant::now();
     let mut clocked_at = Instant::now();
+    let mut last_phrase: Option<String> = None;
     let mut menu_was_open = e.menu_open;
     'run: loop {
         while let Ok(key) = rx.try_recv() {
             // Reader Mode owns the keyboard outright: `h`, `q`, `g` and the
             // rest are motions there, not typewriter controls.
+            // `v` is free everywhere outside the reader. Forms and the picker
+            // own the keyboard, so a typed `v` there is never stolen.
+            if e.mode != engine::Mode::Reader
+                && matches!(key, b'v' | b'V')
+                && !e.menu_open
+                && e.form.is_none()
+                && e.plan_form.is_none()
+                && e.todo_input.is_none()
+            {
+                let on = voice.toggle_enabled();
+                doc_reader.reload_voice_config();
+                last_phrase = None;
+                e.notice = Some((
+                    format!("VOICE {}", if on { "ON" } else { "OFF" }),
+                    2.5,
+                ));
+                continue;
+            }
             if e.mode == engine::Mode::Reader {
                 match doc_reader.key(key) {
                     reader::Outcome::Leave => {
@@ -523,6 +568,20 @@ fn main() {
             }
         }
 
+        // Voice follows the phrase, not the key that caused it: skipping,
+        // arrows and live reloads all change `text`, and each gets one utterance.
+        voice.poll();
+        if let Some(err) = voice.take_error() {
+            e.notice = Some((format!("VOICE: {err}"), 3.0));
+        }
+        if e.mode == engine::Mode::Words && !e.menu_open && voice.wants_words() {
+            let phrase = e.text.clone();
+            if !phrase.trim().is_empty() && last_phrase.as_deref() != Some(phrase.as_str()) {
+                last_phrase = Some(phrase.clone());
+                voice.speak_phrase(&phrase);
+            }
+        }
+
         out.clear();
         out.put("\x1b[H");
         if e.mode == engine::Mode::Reader {
@@ -548,6 +607,8 @@ fn main() {
         }
     }
 
+    voice.stop();
+    doc_reader.silence();
     tty.restore();
 }
 

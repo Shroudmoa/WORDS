@@ -269,7 +269,7 @@ pub fn char_width(c: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::document::{Kind, Line};
+    use crate::reader::document::Kind;
 
     fn doc(lines: &[&str]) -> Document {
         Document::from_text(

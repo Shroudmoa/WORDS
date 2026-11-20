@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use crate::config;
 use crate::engine::{KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_UP};
+use crate::voice::{self, Sentence, Voice};
 use document::Document;
 use layout::Layout;
 
@@ -100,6 +101,15 @@ pub struct Reader {
     pub help: bool,
     /// A `:` command whose effect belongs to the frame loop.
     pending_action: Option<Outcome>,
+
+    /// Speech state lives here, not in the engine: the reader owns its
+    /// document and the sentences it can read aloud.
+    voice: Voice,
+    sentences: Vec<Sentence>,
+    /// The sentence the worker last said it was speaking.
+    spoken: Option<usize>,
+    /// Where play resumes after a pause, or the sentence a jump selected.
+    voice_index: usize,
 }
 
 impl Reader {
@@ -120,6 +130,10 @@ impl Reader {
             message: None,
             help: false,
             pending_action: None,
+            voice: Voice::new(voice::Config::load()),
+            sentences: Vec::new(),
+            spoken: None,
+            voice_index: 0,
         };
         r.set_size(cols, rows);
         r
@@ -153,6 +167,7 @@ impl Reader {
     /// Load a document, remembering where we were in the previous one and
     /// restoring the saved position for this one.
     pub fn open(&mut self, path: &Path) -> Result<(), String> {
+        self.silence();
         self.remember();
         let doc = Document::load(path)?;
         self.chars = doc
@@ -164,6 +179,8 @@ impl Reader {
         self.layout = None;
         self.rebuild_layout();
         self.cursor = history::load(path).unwrap_or_default();
+        self.rebuild_sentences();
+        self.voice_index = self.sentence_at_cursor();
         self.top = 0;
         self.ui = Ui::Normal;
         self.pending = Pending::None;
@@ -183,6 +200,122 @@ impl Reader {
 
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.as_ref()
+    }
+
+    /// The sentence currently being spoken, for the read-along highlight.
+    pub fn spoken(&self) -> Option<&Sentence> {
+        self.spoken.and_then(|i| self.sentences.get(i))
+    }
+
+    /// Stop playback. Called on leave, quit, document change and pause.
+    pub fn silence(&mut self) {
+        self.voice.stop();
+        self.spoken = None;
+    }
+
+    /// Pick up an edit to the voice config made from outside the reader.
+    pub fn reload_voice_config(&mut self) {
+        self.voice.reload_config();
+    }
+
+    fn rebuild_sentences(&mut self) {
+        self.sentences = voice::sentences(&self.chars);
+    }
+
+    /// Which sentence contains the cursor, or the nearest one before it.
+    fn sentence_at_cursor(&self) -> usize {
+        let contains = |s: &Sentence| {
+            (self.cursor.line > s.start.0
+                || (self.cursor.line == s.start.0 && self.cursor.col >= s.start.1))
+                && (self.cursor.line < s.end.0
+                    || (self.cursor.line == s.end.0 && self.cursor.col < s.end.1))
+        };
+        self.sentences
+            .iter()
+            .position(contains)
+            .or_else(|| {
+                self.sentences.iter().rposition(|s| {
+                    (s.start.0, s.start.1) <= (self.cursor.line, self.cursor.col)
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    fn goto_sentence(&mut self, index: usize) {
+        let Some(s) = self.sentences.get(index) else {
+            return;
+        };
+        self.cursor = Pos {
+            line: s.start.0,
+            col: s.start.1,
+        };
+        self.goal = 0;
+        self.ensure_visible();
+    }
+
+    fn start_voice_from(&mut self, index: usize) {
+        if self.sentences.is_empty() {
+            self.say("NOTHING TO SPEAK");
+            return;
+        }
+        if !self.voice.wants_reader() {
+            self.say("VOICE OFF — EDIT ~/.config/words/voice");
+            return;
+        }
+        self.voice_index = index.min(self.sentences.len() - 1);
+        let texts = self.sentences.iter().map(|s| s.text.clone()).collect();
+        self.voice.speak(texts, self.voice_index);
+        self.say(format!(
+            "READING {}/{}",
+            self.voice_index + 1,
+            self.sentences.len()
+        ));
+    }
+
+    /// Space: pause what is playing, or read on from where we left off.
+    fn toggle_voice(&mut self) {
+        if self.voice.playing {
+            self.voice_index = self.voice.current.unwrap_or(self.voice_index);
+            self.silence();
+            self.say("PAUSED");
+        } else {
+            let at = self.sentence_at_cursor().max(self.voice_index);
+            self.start_voice_from(at);
+        }
+    }
+
+    /// `<` and `>` step one sentence, carrying playback with them if active.
+    fn jump_sentence(&mut self, delta: isize) {
+        if self.sentences.is_empty() {
+            self.say("NO SENTENCES");
+            return;
+        }
+        let base = self.voice.current.unwrap_or(self.sentence_at_cursor());
+        let index = (base as isize + delta).clamp(0, self.sentences.len() as isize - 1) as usize;
+        self.voice_index = index;
+        self.goto_sentence(index);
+        if self.voice.playing {
+            let texts = self.sentences.iter().map(|s| s.text.clone()).collect();
+            self.voice.speak(texts, index);
+        }
+        self.say(format!("SENTENCE {}/{}", index + 1, self.sentences.len()));
+    }
+
+    /// Drain speech events and follow the spoken sentence with the cursor.
+    fn poll_voice(&mut self) {
+        self.voice.poll();
+        if let Some(err) = self.voice.take_error() {
+            self.say(format!("VOICE: {err}"));
+        }
+        match self.voice.current {
+            Some(i) if Some(i) != self.spoken => {
+                self.spoken = Some(i);
+                self.voice_index = i;
+                self.goto_sentence(i);
+            }
+            None if self.spoken.is_some() => self.spoken = None,
+            _ => {}
+        }
     }
 
     pub fn selected_text(&self) -> String {
@@ -658,10 +791,25 @@ impl Reader {
         }
         match cmd.as_str() {
             "q" | "quit" => {
+                self.silence();
                 self.say("LEAVING");
                 self.pending_action = Some(Outcome::Leave);
             }
             "help" => self.help = true,
+            "voice" => {
+                let on = self.voice.toggle_enabled();
+                self.say(if on { "VOICE ON" } else { "VOICE OFF" });
+            }
+            _ if cmd.starts_with("rate ") => {
+                let raw = cmd[5..].trim();
+                match raw.parse::<i32>() {
+                    Ok(n) => {
+                        self.voice.set_rate(n);
+                        self.say(format!("RATE {}", self.voice.config().rate));
+                    }
+                    Err(_) => self.say("BAD RATE"),
+                }
+            }
             _ if cmd.starts_with("e ") || cmd.starts_with("edit ") => {
                 let raw = cmd.split_once(' ').map(|(_, p)| p).unwrap_or("").trim();
                 if raw.is_empty() {
@@ -692,6 +840,7 @@ impl Reader {
 
     pub fn key(&mut self, b: u8) -> Outcome {
         self.expire_message();
+        self.poll_voice();
 
         // Prompts own the keyboard: every character typed goes into them.
         match &self.ui {
@@ -750,10 +899,12 @@ impl Reader {
 
         match b {
             b'q' | b'Q' => {
+                self.silence();
                 self.remember();
                 Outcome::Leave
             }
             b'\x03' => {
+                self.silence();
                 self.remember();
                 Outcome::Quit
             }
@@ -765,6 +916,7 @@ impl Reader {
                     self.anchor = None;
                     Outcome::None
                 } else {
+                    self.silence();
                     self.remember();
                     Outcome::Leave
                 }
@@ -787,6 +939,40 @@ impl Reader {
             }
             0x08 => {
                 self.help = !self.help;
+                Outcome::None
+            }
+            b' ' => {
+                self.toggle_voice();
+                Outcome::None
+            }
+            b's' | b'S' => {
+                self.silence();
+                self.say("STOPPED");
+                Outcome::None
+            }
+            b'>' => {
+                self.jump_sentence(1);
+                Outcome::None
+            }
+            b'<' => {
+                self.jump_sentence(-1);
+                Outcome::None
+            }
+            b'[' => {
+                let rate = self.voice.config().rate - 10;
+                self.voice.set_rate(rate);
+                self.say(format!("RATE {}", self.voice.config().rate));
+                Outcome::None
+            }
+            b']' => {
+                let rate = self.voice.config().rate + 10;
+                self.voice.set_rate(rate);
+                self.say(format!("RATE {}", self.voice.config().rate));
+                Outcome::None
+            }
+            b'V' => {
+                let on = self.voice.toggle_enabled();
+                self.say(if on { "VOICE ON" } else { "VOICE OFF" });
                 Outcome::None
             }
             b'h' | KEY_LEFT => {
@@ -1004,6 +1190,7 @@ impl Reader {
     /// know how the reader stores its state.
     pub fn draw(&mut self, o: &mut crate::term::Out, cols: usize, rows: usize) {
         self.set_size(cols, rows);
+        self.poll_voice();
         render::draw(self, o, cols, rows);
     }
 }

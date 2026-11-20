@@ -12,6 +12,11 @@ Reader Mode is a seventh thing: it opens a whole `.txt` or `.md` document in a
 plain, left-aligned, top-to-bottom terminal layout with Vim-style movement. It
 is an addition to the typewriter, not a replacement for it.
 
+Voice is optional and sits across both: the typewriter can say each new phrase,
+and Reader can read a document aloud while tinting the sentence being spoken.
+There is no audio crate in the build — WORDS uses whatever speech command the
+machine already has, and reports a small message instead if none is available.
+
 Zero dependencies. It is raw ANSI escape codes and a 5×7 bitmap font, so it
 builds in seconds and runs anywhere with a terminal.
 
@@ -61,7 +66,8 @@ Anything dropped in `$XDG_CONFIG_HOME/words` (or `~/.config/words`) — every
 `.txt` file there, by its name — shows up on the picker, so prose can be kept
 handy without naming it on the command line. Saved deadlines share the
 directory in a file called `deadlines`; the todo list and the planner use
-`todos` and `plan`. None of them are `.txt`, so they stay off the phrase list.
+`todos` and `plan`; voice settings live in `voice`. None of them are `.txt`, so
+they stay off the phrase list.
 
 ## Modes
 
@@ -119,6 +125,12 @@ cursor itself is only a faint tint on one character.
 | `yy` | copy the current line |
 | `:e PATH` | open another document (`:q` leaves, `:help` shows keys) |
 | `ctrl-h` | toggle the in-app key panel |
+| `space` | read aloud from the cursor, or pause playback |
+| `s` | stop playback |
+| `<` / `>` | previous / next sentence |
+| `[` / `]` | slower / faster speech |
+| `V` | toggle voice from the config |
+| `:voice`, `:rate N` | toggle voice, set words per minute |
 | `q` / `esc` | leave Reader Mode |
 
 Search is case-insensitive, highlights every match in the visible text and
@@ -132,6 +144,38 @@ The last position in each document is saved in
 when the same document is opened again. On the `CLOCK` the date sits under the digits
 (`MON 2026-10-12`) and a moving head sweeps the control bar, because a wall
 clock has no start or finish to fill toward.
+
+## Voice
+
+`$XDG_CONFIG_HOME/words/voice` (or `~/.config/words/voice`) is a plain
+`key=value` file. It is created on the first settings change; the defaults are
+already listening:
+
+```ini
+enabled=true       # master switch; v toggles it while running
+reader=true        # read documents aloud in Reader Mode
+words=true         # say each typewriter phrase as it appears
+backend=auto       # auto / espeak / say / spd-say / gtts / none
+voice=             # optional voice name or language for the local engine
+rate=175           # words per minute
+volume=100         # percentage
+lang=en            # language code for gTTS
+```
+
+`auto` tries `espeak-ng`, `espeak`, `say` and `spd-say` in that order, then falls
+back to Python `gTTS` — the same library the Telegram bot uses — played through
+`ffplay`, `mpg123`, `afplay` or `cvlc`. That last path needs a network. `backend=none`
+keeps the interface and highlights working without starting any audio process;
+a missing engine reports a message on the prompt line rather than failing the
+frame loop. Playback runs on a worker thread, so resizing and navigation stay
+at full speed.
+
+In Reader Mode, `space` reads from the cursor and pauses; the sentence being
+spoken is tinted green and the viewport follows it. `s` stops, `<`/`>` step one
+sentence, `[`/`]` change speed, and `V` or `:voice` flips the master switch. In
+the typewriter there is nothing to press: a phrase is spoken once when it
+changes, whether that came from a key, a live file edit or a mode switch. `v`
+outside the reader toggles voice on and off and writes the setting back.
 
 ## Deadlines
 
@@ -226,6 +270,7 @@ The planner sorts by day and start time, and only draws the day it is showing.
 | `G` | force a glitch |
 | `B` | pin the control bar |
 | `T` | next mode |
+| `V` | voice on / off |
 | `M` | open the picker |
 | `H` / `?` | controls |
 | `Q` | quit |
@@ -288,6 +333,7 @@ src/plan.rs     saved planner events and the on-disk format
 src/time.rs     UTC offset, civil-date maths, the clock's strings
 src/config.rs   the ~/.config/words directory the picker reads
 src/reader/     Reader Mode: document loading, layout, navigation, rendering
+src/voice.rs    voice config, sentence splitting, playback worker, backends
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 ```
 
@@ -306,6 +352,8 @@ file formats round-trip, bad lines are skipped, tasks tick and clear, events
 add, edit, delete, sort, and refuse an end before their start. The reader adds
 tests for Markdown rendering, wrapping, Unicode widths, every navigation
 command, search and selection, empty documents, resizing and saved positions.
+Voice tests cover the config round-trip, sentence boundaries, Unicode positions
+and the silent backend, plus the reader's sentence jumps, speed keys and stop.
 
 ## Notes
 

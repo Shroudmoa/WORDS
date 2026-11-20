@@ -89,7 +89,12 @@ pub fn reader_files() -> Vec<PathBuf> {
 fn is_reserved(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "deadlines" || n == "todos" || n == "plan" || n == "positions")
+        .is_some_and(|n| {
+            matches!(
+                n,
+                "deadlines" | "todos" | "plan" | "positions" | "voice"
+            )
+        })
 }
 
 /// What to call a file on the menu: its stem, upper-cased.
@@ -116,6 +121,12 @@ pub fn todos_file() -> Option<PathBuf> {
 /// The file the day planner lives in.
 pub fn plan_file() -> Option<PathBuf> {
     dir().map(|d| d.join("plan"))
+}
+
+/// The voice settings file. Not a `.txt`: like the other state files it would
+/// otherwise turn up in the phrase picker and be read out as prose.
+pub fn voice_file() -> Option<PathBuf> {
+    dir().map(|d| d.join("voice"))
 }
 
 #[cfg(test)]

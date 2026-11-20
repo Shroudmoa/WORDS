@@ -5,6 +5,7 @@
 use super::document::{Document, Kind};
 use super::history;
 use super::{Outcome, Pos, Reader, Ui};
+use crate::voice::Voice;
 use std::path::PathBuf;
 
 fn reader(text: &str) -> Reader {
@@ -17,7 +18,9 @@ fn reader_width(text: &str, cols: usize, rows: usize) -> Reader {
     r.chars = doc.lines.iter().map(|l| l.text.chars().collect()).collect();
     r.doc = Some(doc);
     r.layout = None;
+    r.voice = Voice::muted();
     r.rebuild_layout();
+    r.rebuild_sentences();
     r
 }
 
@@ -277,4 +280,49 @@ fn quitting_from_a_prompt_is_not_confused_with_search_text() {
     assert_eq!(r.ui, Ui::Normal);
     let out = r.key(b'q');
     assert_eq!(out, Outcome::Leave);
+}
+
+#[test]
+fn the_document_is_split_into_readable_sentences() {
+    let r = reader("First one. Then two!\n\nThird, last.");
+    let texts: Vec<&str> = r.sentences.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(texts, ["First one.", "Then two!", "Third, last."]);
+    assert_eq!(r.sentences[2].start, (2, 0));
+}
+
+#[test]
+fn sentence_jumps_move_the_cursor_to_the_spoken_line() {
+    let mut r = reader("First one.\nThen two.\nThird one.");
+    tap(&mut r, ">");
+    assert_eq!(r.cursor, Pos { line: 1, col: 0 });
+    tap(&mut r, ">");
+    assert_eq!(r.cursor, Pos { line: 2, col: 0 });
+    tap(&mut r, ">>>");
+    assert_eq!(r.cursor, Pos { line: 2, col: 0 }, "jumps clamp at the end");
+    tap(&mut r, "<");
+    assert_eq!(r.cursor, Pos { line: 1, col: 0 });
+}
+
+#[test]
+fn voice_keys_change_speed_and_stop_without_editing_the_document() {
+    let mut r = reader("Hello world.");
+    let original = r.document().unwrap().raw.clone();
+    let rate = r.voice.config().rate;
+    tap(&mut r, "]");
+    assert_eq!(r.voice.config().rate, rate + 10);
+    tap(&mut r, "[");
+    assert_eq!(r.voice.config().rate, rate);
+    tap(&mut r, " ");
+    tap(&mut r, "s");
+    assert!(!r.voice.playing);
+    assert_eq!(r.document().unwrap().raw, original);
+}
+
+#[test]
+fn leaving_the_reader_stops_speech() {
+    let mut r = reader("A sentence.");
+    tap(&mut r, " ");
+    assert_eq!(r.key(b'q'), Outcome::Leave);
+    assert!(!r.voice.playing);
+    assert!(r.spoken.is_none());
 }
