@@ -10,6 +10,7 @@ mod engine;
 mod font;
 mod phrases;
 mod plan;
+mod reader;
 mod style;
 mod term;
 mod time;
@@ -68,6 +69,8 @@ struct Args {
     todo: bool,
     /// Start on the day planner.
     plan: bool,
+    /// Open a .txt or .md document in Reader Mode.
+    read: Option<String>,
 }
 
 /// `--timer` takes a length in seconds, or `up` / `down` for a stopwatch or the
@@ -96,6 +99,7 @@ fn parse() -> Result<Args, String> {
         menu: false,
         todo: false,
         plan: false,
+        read: None,
     };
     // Peekable so `--timer` can take a value or stand alone, the way `ps` and
     // friends do.
@@ -133,9 +137,15 @@ fn parse() -> Result<Args, String> {
             }
             "-k" | "--clock" => a.clock = true,
             "-m" | "--menu" => a.menu = true,
+            "-r" | "--read" => {
+                a.read = Some(it.next().ok_or("--read needs a file")?);
+            }
             "--todo" => a.todo = true,
             "--plan" => a.plan = true,
             v if v.starts_with('-') => return Err(format!("unknown flag {v}")),
+            // A bare path is the conventional way to open a document. Other
+            // stray arguments keep the old error rather than being guessed at.
+            v if reader::document::kind_of(Path::new(v)).is_some() => a.read = Some(v.to_string()),
             v => return Err(format!("unexpected argument {v}")),
         }
     }
@@ -161,14 +171,15 @@ fn usage() {
     -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
     -k, --clock         start on the wall clock
     -m, --menu          open the picker at startup
+    -r, --read <path>   read a .txt or .md document (also: words file.txt)
         --todo          start on the todo list
         --plan          start on the day planner
     -l, --list          print the built-in phrases and exit
     -h, --help          this text
 
   MODES
-    There are six things this program can be. `T` walks between them, or
-    press `M` for the picker and choose one directly:
+    Six modes are on the `T` ring; press `M` for the picker and choose one
+    directly. Reader is a seventh, opened with --read or from the picker:
 
         WORDS     the typewriter
         COUNTER   a countdown or a stopwatch
@@ -176,6 +187,24 @@ fn usage() {
         DEADLINE  how long is left until a saved moment
         TODO      a little list of things to do
         PLANNER   a day of blocks with a start and an end
+
+    The picker's DOCUMENTS section opens files in Reader Mode. It reads a
+    whole document top to bottom with Vim-style movement; `q` or `esc`
+    returns to whatever was on screen before.
+
+  READER
+        words --read notes.md        open a document to read
+        words notes.txt              the same thing, without the flag
+
+    Movement: h/j/k/l or the arrows, w/b/e, 0/$, gg/G, :N for a line number,
+    and numeric prefixes (`10j`, `5w`). Scrolling: ctrl-d/u (half page),
+    ctrl-f/b (full page), H/M/L (top / middle / bottom), zz (center).
+
+    / and ? search forward and backward, n/N step through matches, v starts a
+    visual selection and y copies it when a clipboard tool is available, and
+    yy copies the current line. `:` also takes `:e PATH` to open another
+    document, `:q` to leave and `:help` for the in-app key panel. The last
+    position in each document is remembered under ~/.config/words/positions.
 
   COUNTER
         words --timer          a 25:00 countdown, armed and waiting
@@ -293,14 +322,35 @@ fn main() {
         return;
     }
 
+    // A bad document path is reported on a normal stderr, before raw mode:
+    // Reader Mode has nothing to show until a file has been opened.
+    if let Some(p) = &args.read {
+        let path = Path::new(p);
+        if reader::document::kind_of(path).is_none() {
+            eprintln!("words: `{p}` is not a .txt or .md document");
+            std::process::exit(2);
+        }
+        if !path.is_file() {
+            eprintln!("words: `{p}` is not a readable file");
+            std::process::exit(2);
+        }
+    }
+
     // Everything is read before the terminal is taken over: an error can then
     // be reported on a normal stderr, and --stdin can't have its keyboard
-    // swallowed by raw mode.
-    let sources = match resolve(&args) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("words: {e}\nrun `words --help` for the full list of options");
-            std::process::exit(2);
+    // swallowed by raw mode. Reader Mode needs no phrase pool at startup.
+    let sources = if args.read.is_some() {
+        Sources {
+            sections: Vec::new(),
+            watch: None,
+        }
+    } else {
+        match resolve(&args) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("words: {e}\nrun `words --help` for the full list of options");
+                std::process::exit(2);
+            }
         }
     };
 
@@ -312,8 +362,23 @@ fn main() {
         }
     };
 
+    // The config directory is where reading positions are kept; make sure it
+    // exists before a document tries to restore one.
+    let _ = config::ensure_dir();
+
     let (cols, rows) = tty.size();
     let mut e = engine::Engine::new(args.seed, cols, rows);
+    // Reader state lives beside the engine, not inside it: the typewriter
+    // knows only that another mode is on screen.
+    let mut doc_reader = reader::Reader::new(cols as usize, rows as usize);
+    if let Some(p) = &args.read {
+        if let Err(err) = doc_reader.open(Path::new(p)) {
+            eprintln!("words: {err}");
+            tty.restore();
+            std::process::exit(1);
+        }
+        e.start_reader();
+    }
     if !sources.sections.is_empty() {
         e.use_sections(&sources.sections);
     }
@@ -355,18 +420,17 @@ fn main() {
     e.plan = plan.clone();
 
     e.set_menu(menu_items(&deadlines, e.year.as_ref(), local, offset));
-    if args.todo {
-        e.start_todo();
+    if args.read.is_none() {
+        if args.todo {
+            e.start_todo();
+        }
+        if args.plan {
+            e.start_plan();
+        }
+        if args.menu {
+            e.open_menu();
+        }
     }
-    if args.plan {
-        e.start_plan();
-    }
-    if args.menu {
-        e.open_menu();
-    }
-    // Make sure the directory the menu reads from exists to be dropped into.
-    let _ = config::ensure_dir();
-
     // --- input ---------------------------------------------------------------
     let (tx, rx) = mpsc::channel::<u8>();
     thread::spawn(move || read_keys(tx));
@@ -382,9 +446,27 @@ fn main() {
     let mut menu_was_open = e.menu_open;
     'run: loop {
         while let Ok(key) = rx.try_recv() {
+            // Reader Mode owns the keyboard outright: `h`, `q`, `g` and the
+            // rest are motions there, not typewriter controls.
+            if e.mode == engine::Mode::Reader {
+                match doc_reader.key(key) {
+                    reader::Outcome::Leave => {
+                        doc_reader.remember();
+                        e.leave_reader();
+                    }
+                    reader::Outcome::Quit => {
+                        doc_reader.remember();
+                        break 'run;
+                    }
+                    reader::Outcome::Open(path) => open_document(&mut doc_reader, &mut e, &path),
+                    reader::Outcome::None => {}
+                }
+                continue;
+            }
             match e.key(key) {
                 engine::Action::Quit => break 'run,
                 engine::Action::OpenFile(path) => open_phrases(&mut e, &mut watch, &path),
+                engine::Action::OpenReader(path) => open_document(&mut doc_reader, &mut e, &path),
                 engine::Action::Forget(i) => forget_deadline(&mut e, &mut deadlines, i),
                 engine::Action::Add(d) => add_deadline(&mut e, &mut deadlines, d),
                 engine::Action::Todos(v) => {
@@ -443,8 +525,14 @@ fn main() {
 
         out.clear();
         out.put("\x1b[H");
-        view::chrome(&e, &mut out, c as usize, r as usize);
-        view::draw(&mut e, &mut out);
+        if e.mode == engine::Mode::Reader {
+            // The reader paints its own header, document and footer on the
+            // page background, so the typewriter's chrome stays out of it.
+            doc_reader.draw(&mut out, c as usize, r as usize);
+        } else {
+            view::chrome(&e, &mut out, c as usize, r as usize);
+            view::draw(&mut e, &mut out);
+        }
         // The bell rides along in the frame's own write, so a countdown that
         // hits zero rings on the same frame it strobes.
         if e.take_beep() {
@@ -518,6 +606,20 @@ fn menu_items(
             items.push(MenuItem::new(label, MenuKind::File(path)));
         }
     }
+
+    // The same `.txt` files are also documents: one row loads phrases into
+    // the typewriter, the other opens the file to be read. `.md` files are
+    // documents only, so they appear just here.
+    let docs = config::reader_files();
+    if !docs.is_empty() {
+        items.push(MenuItem::new("DOCUMENTS", MenuKind::Head));
+        for path in docs {
+            items.push(MenuItem::new(
+                format!("READ · {}", config::label(&path)),
+                MenuKind::Reader(path),
+            ));
+        }
+    }
     items
 }
 
@@ -588,6 +690,20 @@ fn forget_deadline(e: &mut engine::Engine, deadlines: &mut Vec<deadline::Deadlin
         }
     }
     e.notice = Some(("DELETED".to_string(), 2.5));
+}
+
+/// Load a document from the picker or from `:e`, and put Reader Mode on
+/// screen. A failed open stays in the reader with a plain error message.
+fn open_document(doc_reader: &mut reader::Reader, e: &mut engine::Engine, path: &Path) {
+    match doc_reader.open(path) {
+        Ok(()) => e.start_reader(),
+        Err(err) => {
+            doc_reader.report_error(err);
+            if e.mode != engine::Mode::Reader {
+                e.start_reader();
+            }
+        }
+    }
 }
 
 /// Load a phrase file chosen from the menu, put it on screen, and start
@@ -872,6 +988,7 @@ mod tests {
             menu: false,
             todo: false,
             plan: false,
+            read: None,
         }
     }
 

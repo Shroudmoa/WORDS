@@ -6,7 +6,11 @@ them for a beat, then moves on — with glitch bursts tearing through the text.
 
 It is also a countdown/stopwatch, a wall clock, a deadline tracker, a little
 todo list, and a day planner drawn as a small Gantt chart. `T` walks between
-the modes, or open the picker and choose one directly.
+those modes, or open the picker and choose one directly.
+
+Reader Mode is a seventh thing: it opens a whole `.txt` or `.md` document in a
+plain, left-aligned, top-to-bottom terminal layout with Vim-style movement. It
+is an addition to the typewriter, not a replacement for it.
 
 Zero dependencies. It is raw ANSI escape codes and a 5×7 bitmap font, so it
 builds in seconds and runs anywhere with a terminal.
@@ -39,6 +43,7 @@ POSIX-only — Linux, macOS, and the BSDs. Nothing else is needed.
 -t, --timer [spec]  start on the counter: seconds, or `up` / `down`
 -k, --clock         start on the wall clock
 -m, --menu          open the picker at startup
+-r, --read <path>   read a .txt or .md document
     --todo          start on the todo list
     --plan          start on the day planner
 -l, --list          print the built-in phrases and exit
@@ -68,9 +73,63 @@ directory in a file called `deadlines`; the todo list and the planner use
 | `DEADLINE` | a countdown to a moment you named, or to the end of the year |
 | `TODO` | a little list of things to do |
 | `PLANNER` | a day of blocks with a start and an end |
+| `READER` | a whole document in a readable top-to-bottom layout |
 
 `--timer` and `--clock` start straight into the one you asked for; without them
-the typewriter is what you get. On the `CLOCK` the date sits under the digits
+the typewriter is what you get. `words --read notes.md` (or just `words
+notes.txt`) opens Reader Mode; so does choosing a row under `DOCUMENTS` in the
+picker. `q` or `esc` leaves the reader and hands the keyboard back.
+
+## Reader Mode
+
+Reader Mode shows the document as text, not as words appearing in the middle of
+the screen. It starts in `NORMAL` mode. Lines are left-aligned, wrapped to the
+terminal width (capped at 100 columns for comfortable reading), and blank
+lines are kept as paragraph breaks. Resizing the window rewraps the text and
+keeps the current line on screen. Only the visible rows are painted, so a long
+document is no more expensive to draw than a short one; files over 16 MiB or
+200,000 lines are refused with a message rather than loaded.
+
+`.txt` files are shown as written. `.md` files get a small, readable Markdown
+treatment: headings, bold, italic, inline code, links, lists, blockquotes,
+fenced code and horizontal rules become styles on the same text, so search,
+selection and copying see the words rather than the markers. The original file
+content is kept untouched alongside the rendered lines.
+
+The header names the document and the current mode (`NORMAL`, `VISUAL`,
+`SEARCH`, `COMMAND`). The footer gives the current line and column and the
+percentage read. A thin mark in the left gutter shows the current line; the
+cursor itself is only a faint tint on one character.
+
+| Key | Action |
+|---|---|
+| `h` `j` `k` `l` / arrows | move left, down, up, right |
+| `w` / `b` / `e` | next word / previous word / end of word |
+| `0` / `$` | beginning / end of the display row |
+| `gg` / `G` | first / last line |
+| `:{number}` | jump to that line |
+| `10j`, `5w`, … | numeric prefixes on motions |
+| `ctrl-d` / `ctrl-u` | half page down / up |
+| `ctrl-f` / `ctrl-b` | full page down / up |
+| `H` / `M` / `L` | top / middle / bottom of the screen |
+| `zz` | center the current line |
+| `/` / `?` | forward / backward search |
+| `n` / `N` | next / previous match |
+| `v` / `y` | start visual selection / copy it |
+| `yy` | copy the current line |
+| `:e PATH` | open another document (`:q` leaves, `:help` shows keys) |
+| `ctrl-h` | toggle the in-app key panel |
+| `q` / `esc` | leave Reader Mode |
+
+Search is case-insensitive, highlights every match in the visible text and
+wraps at the end of the document. `esc` cancels a search or command prompt.
+Copying uses `xclip`, `xsel` or `pbcopy` if one is installed; without one the
+selection still works and the reader says there is no clipboard available.
+Nothing in Reader Mode writes to the document.
+
+The last position in each document is saved in
+`$XDG_CONFIG_HOME/words/positions` (or `~/.config/words/positions`) and restored
+when the same document is opened again. On the `CLOCK` the date sits under the digits
 (`MON 2026-10-12`) and a moving head sweeps the control bar, because a wall
 clock has no start or finish to fill toward.
 
@@ -176,6 +235,11 @@ On the counter, `SPACE`/`P` run, pause and resume, `C` clears back to the start,
 shorten the run. The wall clock has no controls of its own: it is always
 running.
 
+In the reader the keys are Vim-like: `hjkl`, `w/b/e`, `0/$`, `gg/G`, `:{n}`,
+numeric prefixes, `ctrl-d/u/f/b`, `H/M/L`, `zz`, `/` and `?`, `n/N`, `v` and
+`y`, and `q` or `esc` to leave. The full table and the behaviour of each one
+are in [Reader Mode](#reader-mode) above.
+
 In the picker, `↑`/`↓` (or `W`/`S`, `K`/`J`) move, `ENTER` chooses, a digit
 jumps straight to that row, `X` deletes the highlighted deadline, and `M` or
 `ESC` closes it. Section headings (`MODES`, `DEADLINES`, `PHRASES`) are labels,
@@ -223,6 +287,7 @@ src/todo.rs     saved todo list and the on-disk format
 src/plan.rs     saved planner events and the on-disk format
 src/time.rs     UTC offset, civil-date maths, the clock's strings
 src/config.rs   the ~/.config/words directory the picker reads
+src/reader/     Reader Mode: document loading, layout, navigation, rendering
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 ```
 
@@ -238,7 +303,9 @@ off the screen — alongside the counter, the wall clock's date arithmetic, the
 deadline file's round-trip, the year maths, and the picker's navigation and
 file selection. The todo list and the planner get the same treatment: their
 file formats round-trip, bad lines are skipped, tasks tick and clear, events
-add, edit, delete, sort, and refuse an end before their start.
+add, edit, delete, sort, and refuse an end before their start. The reader adds
+tests for Markdown rendering, wrapping, Unicode widths, every navigation
+command, search and selection, empty documents, resizing and saved positions.
 
 ## Notes
 

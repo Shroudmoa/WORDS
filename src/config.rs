@@ -54,6 +54,44 @@ pub fn phrase_files() -> Vec<PathBuf> {
     dir().map(|d| files_in(&d)).unwrap_or_default()
 }
 
+/// The file Reader Mode keeps last-reading positions in. Deliberately not a
+/// `.txt` or `.md`: the picker offers those, and a list of positions is not
+/// something anyone wants to read as prose.
+pub fn positions_file() -> Option<PathBuf> {
+    dir().map(|d| d.join("positions"))
+}
+
+/// Document files sitting in the config directory, in name order. Both `.txt`
+/// and `.md` are reader documents; the same `.txt` files are also offered as
+/// phrase sources under their own section, which is deliberate -- a file can
+/// be both a phrase pool and something to sit down and read.
+pub fn reader_files() -> Vec<PathBuf> {
+    let Some(d) = dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(d) else {
+        return Vec::new();
+    };
+    let mut names: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|x| x == "txt" || x == "md")
+                && !is_reserved(p)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The three files the other modes own are never documents.
+fn is_reserved(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "deadlines" || n == "todos" || n == "plan" || n == "positions")
+}
+
 /// What to call a file on the menu: its stem, upper-cased.
 pub fn label(path: &Path) -> String {
     path.file_stem()

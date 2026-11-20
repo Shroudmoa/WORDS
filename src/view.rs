@@ -9,6 +9,11 @@ use crate::style::{AMBER, BG, CYAN, DIM, FAINT, FG, GREEN, GLITCH_COLORS, MAGENT
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn draw(e: &mut Engine, o: &mut Out) {
+    // Reader Mode paints its own whole screen; it borrows the palette and the
+    // canvas primitives rather than the typewriter's layers.
+    if e.mode == Mode::Reader {
+        return;
+    }
     let (cols, rows) = (e.cols as usize, e.rows as usize);
     if cols < 20 || rows < 8 {
         e.full = false;
@@ -478,7 +483,7 @@ fn bar(e: &Engine, o: &mut Out, cols: usize, rows: usize) -> usize {
         // A wall clock has no start and no finish, and a deadline has a
         // finish but no start anyone chose -- so both get the moving head
         // rather than a fill that would imply they were heading somewhere.
-        Mode::Clock | Mode::Deadline | Mode::Todo | Mode::Plan => {
+        Mode::Clock | Mode::Deadline | Mode::Todo | Mode::Plan | Mode::Reader => {
             sweep = true;
             0.0
         }
@@ -562,7 +567,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         Mode::Clock => strip_clock(e, o, &mut s, y, cols, a, lbl, val),
         Mode::Deadline => strip_deadline(e, o, &mut s, y, cols, a, lbl, val),
         Mode::Words => strip_words(e, o, &mut s, y, cols, a, lbl, val),
-        Mode::Todo | Mode::Plan => {}
+        Mode::Todo | Mode::Plan | Mode::Reader => {}
     }
     if e.pin {
         s.value(o, y, "pinned", style::mix(BG, AMBER, a));
@@ -578,7 +583,9 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
         Mode::Timer => format!("{}  {}", e.timer_label(), clock(e.elapsed)),
         Mode::Deadline => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
         Mode::Clock => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
-        Mode::Todo | Mode::Plan => format!("{}  {}", e.mode_name(), clock(e.elapsed)),
+        Mode::Todo | Mode::Plan | Mode::Reader => {
+            format!("{}  {}", e.mode_name(), clock(e.elapsed))
+        }
         Mode::Words => format!("cycle {:02}  {}", e.cycle, clock(e.elapsed)),
     };
     let rx = cols.saturating_sub(right.chars().count() + 2);
@@ -604,6 +611,7 @@ fn hud(e: &Engine, o: &mut Out, cols: usize, rows: usize) {
                 Mode::Words => {
                     "w/s speed  space next  f font  r auto  g glitch  m menu  h help  q quit"
                 }
+                Mode::Reader => "hjkl move  / search  v select  q back",
             };
             let h: String = hints.chars().take(avail).collect();
             write_text(o, cols, kx, y, h.trim_end(), key);
@@ -1212,6 +1220,8 @@ fn help_rows(e: &Engine) -> Vec<(&'static str, &'static str)> {
         Mode::Words => v.extend_from_slice(HELP_WORDS),
         Mode::Todo => v.extend_from_slice(HELP_TODO),
         Mode::Plan => v.extend_from_slice(HELP_PLAN),
+        // The reader has its own help panel, drawn by its renderer.
+        Mode::Reader => {}
         // The wall clock and a deadline have no controls of their own: they
         // run because time does.
         Mode::Clock | Mode::Deadline => {}
@@ -1509,7 +1519,7 @@ fn box_border(o: &mut Out, cols: usize, x: usize, y: usize, w: usize, h: usize, 
 /// The clip matters: a run that reaches the last column wraps to the next line
 /// and scrolls the screen, which on a narrow window would shove the whole
 /// layout up a row every frame.
-fn write_text(o: &mut Out, cols: usize, x: usize, y: usize, s: &str, c: Rgb) {
+pub(crate) fn write_text(o: &mut Out, cols: usize, x: usize, y: usize, s: &str, c: Rgb) {
     if x >= cols {
         return;
     }

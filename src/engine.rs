@@ -93,6 +93,10 @@ pub enum Mode {
     Todo,
     /// A day planner: named blocks with a start and an end.
     Plan,
+    /// A whole document, laid out top to bottom with Vim-style navigation.
+    /// The state itself lives in `reader`; the engine only tracks which mode
+    /// is on screen so the existing frame loop can hand keys over.
+    Reader,
 }
 
 /// A countdown or a stopwatch.
@@ -146,6 +150,8 @@ pub enum Action {
     Todos(Vec<Todo>),
     /// The planner changed. The caller writes the whole list back.
     Plan(Vec<Event>),
+    /// The picker chose a document: the caller loads it into Reader Mode.
+    OpenReader(PathBuf),
 }
 
 /// One selectable row on the menu, and what choosing it does.
@@ -187,6 +193,8 @@ pub enum MenuKind {
     Plan,
     /// Load the phrases out of this file and switch to the words.
     File(PathBuf),
+    /// Open this document in Reader Mode.
+    Reader(PathBuf),
 }
 
 /// The add-a-deadline form: three fields, filled in one at a time.
@@ -875,7 +883,7 @@ impl Engine {
                 _ if self.timer.down => "COUNTDOWN".to_string(),
                 _ => "STOPWATCH".to_string(),
             }),
-            Mode::Words | Mode::Todo | Mode::Plan => None,
+            Mode::Words | Mode::Todo | Mode::Plan | Mode::Reader => None,
         }
     }
 
@@ -1307,6 +1315,8 @@ impl Engine {
                     self.phase = match self.mode {
                         Mode::Timer => Phase::Ready,
                         Mode::Clock | Mode::Deadline | Mode::Todo | Mode::Plan => Phase::Running,
+                        // Reader Mode is parked: it has no phases of its own.
+                        Mode::Reader => Phase::Resting,
                         Mode::Words => Phase::Typing,
                     };
                     self.full = true;
@@ -1367,7 +1377,7 @@ impl Engine {
             Mode::Timer => self.update_timer(dt),
             Mode::Deadline => self.update_deadline(dt),
             Mode::Clock => self.update_clock(dt),
-            Mode::Words | Mode::Todo | Mode::Plan => {}
+            Mode::Words | Mode::Todo | Mode::Plan | Mode::Reader => {}
         }
     }
 
@@ -1452,6 +1462,7 @@ impl Engine {
             Mode::Deadline => "DEADLINE",
             Mode::Todo => "TODO",
             Mode::Plan => "PLANNER",
+            Mode::Reader => "READER",
         }
     }
 
@@ -1468,6 +1479,9 @@ impl Engine {
             Mode::Deadline => Mode::Todo,
             Mode::Todo => Mode::Plan,
             Mode::Plan => Mode::Words,
+            // The reader is entered through --read or the picker; `T` inside
+            // it is handled by the reader itself and simply returns here.
+            Mode::Reader => Mode::Words,
         };
         self.set_mode(next);
         self.notice = Some((self.mode_name().to_string(), 2.0));
@@ -1524,10 +1538,26 @@ impl Engine {
             }
             Mode::Todo => self.start_todo(),
             Mode::Plan => self.start_plan(),
+            Mode::Reader => {
+                // The document and every bit of reader state live outside the
+                // engine; all the mode switch does is stop the typewriter.
+                self.mode = Mode::Reader;
+            }
         }
         self.full = true;
         self.idle = 0.0;
         self.hud_target = 1.0;
+    }
+
+    /// Enter Reader Mode. The caller loads the document first; this only
+    /// parks the typewriter and lets the frame loop hand keys to the reader.
+    pub fn start_reader(&mut self) {
+        self.set_mode(Mode::Reader);
+    }
+
+    /// Leave Reader Mode and hand the typewriter its phrase back untouched.
+    pub fn leave_reader(&mut self) {
+        self.set_mode(Mode::Words);
     }
 
     // -- the menu ------------------------------------------------------------
@@ -1665,6 +1695,7 @@ impl Engine {
             MenuKind::Todo => Mode::Todo,
             MenuKind::Plan => Mode::Plan,
             MenuKind::File(path) => return Action::OpenFile(path.clone()),
+            MenuKind::Reader(path) => return Action::OpenReader(path.clone()),
             // Handled above; the match only has to be exhaustive.
             MenuKind::Head | MenuKind::Year | MenuKind::Deadline(_) | MenuKind::Add => {
                 return Action::None
@@ -1774,9 +1805,9 @@ impl Engine {
     }
 
     fn toggle_font(&mut self) {
-        // A todo list and a planner are text on the terminal's own font; the
-        // big pixel font has nothing to say there.
-        if matches!(self.mode, Mode::Todo | Mode::Plan) {
+        // A todo list, a planner and a document are text on the terminal's own
+        // font; the big pixel font has nothing to say there.
+        if matches!(self.mode, Mode::Todo | Mode::Plan | Mode::Reader) {
             return;
         }
         self.pixel = !self.pixel;
