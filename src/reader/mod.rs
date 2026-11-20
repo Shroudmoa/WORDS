@@ -102,18 +102,36 @@ pub struct Reader {
     /// A `:` command whose effect belongs to the frame loop.
     pending_action: Option<Outcome>,
 
-    /// Speech state lives here, not in the engine: the reader owns its
-    /// document and the sentences it can read aloud.
+    /// A cloneable handle to the one engine owned by the frame loop. It is a
+    /// handle, not a second worker: main and Reader see the same state.
     voice: Voice,
     sentences: Vec<Sentence>,
     /// The sentence the worker last said it was speaking.
     spoken: Option<usize>,
+    /// Document range of the word currently being spoken.
+    word_mark: Option<(Pos, Pos)>,
     /// Where play resumes after a pause, or the sentence a jump selected.
     voice_index: usize,
 }
 
+/// Convert a word boundary (char range inside a sentence) into document
+/// positions. Sentence positions are kept per char, so hard wraps and Unicode
+/// do not drift the highlight.
+fn word_mark(sentence: &Sentence, from: usize, to: usize) -> Option<(Pos, Pos)> {
+    let a = sentence.positions.get(from).copied()?;
+    let b = sentence.positions.get(to.saturating_sub(1)).copied()?;
+    Some((Pos { line: a.0, col: a.1 }, Pos { line: b.0, col: b.1 + 1 }))
+}
+
 impl Reader {
+    /// Construct a reader with its own engine (tests only in the binary).
+    #[cfg(test)]
     pub fn new(cols: usize, rows: usize) -> Reader {
+        Self::with_voice(cols, rows, Voice::new(voice::Config::load()))
+    }
+
+    /// Construct a reader that shares the frame loop's engine.
+    pub fn with_voice(cols: usize, rows: usize, voice: Voice) -> Reader {
         let mut r = Reader {
             doc: None,
             chars: Vec::new(),
@@ -130,9 +148,10 @@ impl Reader {
             message: None,
             help: false,
             pending_action: None,
-            voice: Voice::new(voice::Config::load()),
+            voice,
             sentences: Vec::new(),
             spoken: None,
+            word_mark: None,
             voice_index: 0,
         };
         r.set_size(cols, rows);
@@ -207,10 +226,16 @@ impl Reader {
         self.spoken.and_then(|i| self.sentences.get(i))
     }
 
-    /// Stop playback. Called on leave, quit, document change and pause.
+    /// Document range of the current word, if any.
+    pub fn current_word(&self) -> Option<(Pos, Pos)> {
+        self.word_mark
+    }
+
+    /// Stop playback. Called on leave, quit and document change.
     pub fn silence(&mut self) {
         self.voice.stop();
         self.spoken = None;
+        self.word_mark = None;
     }
 
     /// Pick up an edit to the voice config made from outside the reader.
@@ -263,8 +288,7 @@ impl Reader {
             return;
         }
         self.voice_index = index.min(self.sentences.len() - 1);
-        let texts = self.sentences.iter().map(|s| s.text.clone()).collect();
-        self.voice.speak(texts, self.voice_index);
+        self.voice.speak(self.sentences.clone(), self.voice_index);
         self.say(format!(
             "READING {}/{}",
             self.voice_index + 1,
@@ -272,12 +296,15 @@ impl Reader {
         ));
     }
 
-    /// Space: pause what is playing, or read on from where we left off.
+    /// Space: pause at the exact word, resume there, or start reading.
     fn toggle_voice(&mut self) {
-        if self.voice.playing {
-            self.voice_index = self.voice.current.unwrap_or(self.voice_index);
-            self.silence();
+        if self.voice.is_playing() {
+            self.voice_index = self.voice.current_sentence().unwrap_or(self.voice_index);
+            self.voice.pause();
             self.say("PAUSED");
+        } else if self.voice.is_paused() {
+            self.voice.resume();
+            self.say("RESUMED");
         } else {
             let at = self.sentence_at_cursor().max(self.voice_index);
             self.start_voice_from(at);
@@ -290,13 +317,15 @@ impl Reader {
             self.say("NO SENTENCES");
             return;
         }
-        let base = self.voice.current.unwrap_or(self.sentence_at_cursor());
+        let base = self
+            .voice
+            .current_sentence()
+            .unwrap_or(self.sentence_at_cursor());
         let index = (base as isize + delta).clamp(0, self.sentences.len() as isize - 1) as usize;
         self.voice_index = index;
         self.goto_sentence(index);
-        if self.voice.playing {
-            let texts = self.sentences.iter().map(|s| s.text.clone()).collect();
-            self.voice.speak(texts, index);
+        if self.voice.is_playing() || self.voice.is_paused() {
+            self.voice.seek_sentence(index);
         }
         self.say(format!("SENTENCE {}/{}", index + 1, self.sentences.len()));
     }
@@ -307,13 +336,20 @@ impl Reader {
         if let Some(err) = self.voice.take_error() {
             self.say(format!("VOICE: {err}"));
         }
-        match self.voice.current {
+        self.word_mark = self
+            .voice
+            .current_word()
+            .and_then(|(si, from, to)| word_mark(self.sentences.get(si)?, from, to));
+        match self.voice.current_sentence() {
             Some(i) if Some(i) != self.spoken => {
                 self.spoken = Some(i);
                 self.voice_index = i;
                 self.goto_sentence(i);
             }
-            None if self.spoken.is_some() => self.spoken = None,
+            None if self.spoken.is_some() => {
+                self.spoken = None;
+                self.word_mark = None;
+            }
             _ => {}
         }
     }
@@ -799,6 +835,20 @@ impl Reader {
             "voice" => {
                 let on = self.voice.toggle_enabled();
                 self.say(if on { "VOICE ON" } else { "VOICE OFF" });
+            }
+            "preview" => {
+                self.voice.preview();
+                self.say("PREVIEW");
+            }
+            "voices" => self.say("SEE: words --voice-doctor"),
+            _ if cmd.starts_with("voice ") => {
+                let name = cmd[6..].trim();
+                if name.is_empty() {
+                    self.say("VOICE NAME REQUIRED");
+                } else {
+                    self.voice.set_voice(name);
+                    self.say(format!("VOICE {name} — :preview TO HEAR IT"));
+                }
             }
             _ if cmd.starts_with("rate ") => {
                 let raw = cmd[5..].trim();

@@ -314,8 +314,18 @@ fn voice_keys_change_speed_and_stop_without_editing_the_document() {
     assert_eq!(r.voice.config().rate, rate);
     tap(&mut r, " ");
     tap(&mut r, "s");
-    assert!(!r.voice.playing);
+    assert!(!r.voice.is_playing());
     assert_eq!(r.document().unwrap().raw, original);
+}
+
+#[test]
+fn word_timings_map_back_to_document_positions_across_a_wrap() {
+    let r = reader("a long sentence\nwrapped over lines.");
+    let s = &r.sentences[0];
+    assert_eq!(s.text, "a long sentence wrapped over lines.");
+    let (a, b) = super::word_mark(s, 16, 23).unwrap();
+    assert_eq!(a, Pos { line: 1, col: 0 });
+    assert_eq!(b, Pos { line: 1, col: 7 });
 }
 
 #[test]
@@ -323,6 +333,6 @@ fn leaving_the_reader_stops_speech() {
     let mut r = reader("A sentence.");
     tap(&mut r, " ");
     assert_eq!(r.key(b'q'), Outcome::Leave);
-    assert!(!r.voice.playing);
+    assert!(!r.voice.is_playing());
     assert!(r.spoken.is_none());
 }

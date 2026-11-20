@@ -130,7 +130,8 @@ cursor itself is only a faint tint on one character.
 | `<` / `>` | previous / next sentence |
 | `[` / `]` | slower / faster speech |
 | `V` | toggle voice from the config |
-| `:voice`, `:rate N` | toggle voice, set words per minute |
+| `:voice NAME`, `:preview` | switch neural voice, hear a sample |
+| `:rate N` | set words per minute |
 | `q` / `esc` | leave Reader Mode |
 
 Search is case-insensitive, highlights every match in the visible text and
@@ -147,33 +148,58 @@ clock has no start or finish to fill toward.
 
 ## Voice
 
+The default voice is **Microsoft Edge neural speech**, not a synth that merely
+works. WORDS embeds a small Python helper (the same Rust-calls-Python pattern
+as `src/v3.py`) that uses `edge-tts` to stream audio and word boundaries. Rust
+stays dependency-free: it owns the cache, playback clock and read-along
+highlighting; Python only produces sound.
+
+One-time setup:
+
+```sh
+python3 -m pip install edge-tts
+words --voice-doctor
+```
+
+`--voice-doctor` reports Python, the helper, available audio players and the
+config path. A player such as `ffplay`, `mpg123`, `paplay`, `aplay` or `afplay`
+is still needed to actually hear the MP3. Without one, the reader keeps working
+and the prompt explains what is missing.
+
 `$XDG_CONFIG_HOME/words/voice` (or `~/.config/words/voice`) is a plain
 `key=value` file. It is created on the first settings change; the defaults are
 already listening:
 
 ```ini
-enabled=true       # master switch; v toggles it while running
-reader=true        # read documents aloud in Reader Mode
-words=true         # say each typewriter phrase as it appears
-backend=auto       # auto / espeak / say / spd-say / gtts / none
-voice=             # optional voice name or language for the local engine
-rate=175           # words per minute
-volume=100         # percentage
-lang=en            # language code for gTTS
+enabled=true                # master switch; v toggles it while running
+reader=true                 # read documents aloud in Reader Mode
+words=true                  # say each typewriter phrase as it appears
+backend=edge                # edge / piper / say / espeak / spd-say / none
+voice=en-US-AvaNeural       # Edge voice name, or a Piper .onnx path
+rate=175                    # words per minute
+volume=100                  # percentage
+pitch=+0Hz                  # Edge pitch, e.g. -3Hz
+lang=en-US                  # language hint
 ```
 
-`auto` tries `espeak-ng`, `espeak`, `say` and `spd-say` in that order, then falls
-back to Python `gTTS` — the same library the Telegram bot uses — played through
-`ffplay`, `mpg123`, `afplay` or `cvlc`. That last path needs a network. `backend=none`
-keeps the interface and highlights working without starting any audio process;
-a missing engine reports a message on the prompt line rather than failing the
-frame loop. Playback runs on a worker thread, so resizing and navigation stay
-at full speed.
+Older files with `backend=auto` or `backend=gtts` are upgraded to `edge` on
+read. `piper`, `say`, `espeak` and `spd-say` are explicit fallbacks, chosen by
+setting `backend`; they are not used silently when the neural backend fails.
+`backend=none` keeps the interface and highlights working without starting any
+audio process. A missing engine reports a message on the prompt line rather
+than failing the frame loop.
 
-In Reader Mode, `space` reads from the cursor and pauses; the sentence being
-spoken is tinted green and the viewport follows it. `s` stops, `<`/`>` step one
-sentence, `[`/`]` change speed, and `V` or `:voice` flips the master switch. In
-the typewriter there is nothing to press: a phrase is spoken once when it
+Audio and its word timings are cached under `voice-cache/`, keyed by text,
+voice, rate and pitch, so a repeated phrase or document does not hit the
+network again. Edge returns precise word boundaries: the current word is tinted
+a brighter green than its sentence, and highlighting comes from the playback
+clock rather than a guessed word count.
+
+In Reader Mode, `space` reads from the cursor, pauses at the exact word and
+resumes there; `s` stops; `<`/`>` seek a sentence with playback running;
+`[`/`]` change speed; `V` or bare `:voice` flips the master switch;
+`:voice en-GB-SoniaNeural` switches voice, and `:preview` speaks a sample.
+In the typewriter there is nothing to press: a phrase is spoken once when it
 changes, whether that came from a key, a live file edit or a mode switch. `v`
 outside the reader toggles voice on and off and writes the setting back.
 
@@ -333,7 +359,8 @@ src/plan.rs     saved planner events and the on-disk format
 src/time.rs     UTC offset, civil-date maths, the clock's strings
 src/config.rs   the ~/.config/words directory the picker reads
 src/reader/     Reader Mode: document loading, layout, navigation, rendering
-src/voice.rs    voice config, sentence splitting, playback worker, backends
+src/voice.rs       voice config, cache, word timings, playback worker, backends
+src/voice_helper.py embedded edge-tts helper: synthesis + word boundaries
 src/term.rs     raw mode, alt screen, restore-on-drop and on panic
 ```
 

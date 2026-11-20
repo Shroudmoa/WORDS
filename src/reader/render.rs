@@ -35,11 +35,14 @@ pub fn draw(r: &Reader, o: &mut Out, cols: usize, rows: usize) {
         .document()
         .map(|d| d.kind.label())
         .unwrap_or("----");
-    let tag = format!(
-        "{kind}  {}{} ",
-        r.ui.label(),
-        if r.voice.playing { "  \u{25b6} VOICE" } else { "" }
-    );
+    let voice_tag = if r.voice.is_playing() {
+        "  \u{25b6} VOICE"
+    } else if r.voice.is_paused() {
+        "  \u{2016} PAUSED"
+    } else {
+        ""
+    };
+    let tag = format!("{kind}  {}{voice_tag} ", r.ui.label());
     write_text(o, cols, cols.saturating_sub(tag.chars().count() + 2), 0, &tag, cyan);
     style::cells(o, 1, 1, cols.saturating_sub(2), dim);
 
@@ -100,8 +103,8 @@ pub fn draw(r: &Reader, o: &mut Out, cols: usize, rows: usize) {
     } else if let Some(msg) = r.message() {
         write_text(o, cols, 2, prompt_row, msg, AMBER);
     } else {
-        let hint = if r.voice.playing {
-            "space pause · s stop · < > sentence · [ ] rate · V toggle voice"
+        let hint = if r.voice.is_playing() || r.voice.is_paused() {
+            "space pause/resume · s stop · < > sentence · [ ] rate · V toggle voice"
         } else {
             "gg first · G last · ctrl-d/u/f/b scroll · H/M/L screen · space read aloud · ctrl-h help"
         };
@@ -152,29 +155,36 @@ fn draw_row(
         None
     };
 
+    let word_range = r.current_word();
+    let bg_for = |col: usize| -> Rgb {
+        let in_hit = hits.iter().any(|(a, b)| col >= *a && col < *b);
+        let in_sel = selected.is_some_and(|(a, b)| {
+            (row.line > a.line || (row.line == a.line && col >= a.col))
+                && (row.line < b.line || (row.line == b.line && col < b.col))
+        });
+        let in_word = word_range.is_some_and(|(a, b)| in_range(a, b, row.line, col));
+        let in_voice = voice_span.is_some_and(|s| in_sentence(s, row.line, col));
+        if in_hit {
+            style::mix(BG, AMBER, 0.38)
+        } else if in_sel {
+            style::mix(BG, MAGENTA, 0.32)
+        } else if in_word {
+            style::mix(BG, GREEN, 0.55)
+        } else if in_voice {
+            style::mix(BG, GREEN, 0.28)
+        } else if row.line == r.cursor.line && col == r.cursor.col {
+            style::mix(BG, CYAN, 0.22)
+        } else {
+            BG
+        }
+    };
+
     let mut i = row.start;
     let mut x = x0;
     while i < row.end && x < cols {
         let style = style_at(line.spans.as_slice(), i);
         let fg = color_for(style);
-        let on_cursor = row.line == r.cursor.line && i == r.cursor.col;
-        let in_hit = hits.iter().any(|(a, b)| i >= *a && i < *b);
-        let in_sel = selected.is_some_and(|(a, b)| {
-            (row.line > a.line || (row.line == a.line && i >= a.col))
-                && (row.line < b.line || (row.line == b.line && i < b.col))
-        });
-        let in_voice = voice_span.is_some_and(|s| in_sentence(s, row.line, i));
-        let bg = if in_hit {
-            style::mix(BG, AMBER, 0.38)
-        } else if in_sel {
-            style::mix(BG, MAGENTA, 0.32)
-        } else if in_voice {
-            style::mix(BG, GREEN, 0.28)
-        } else if on_cursor {
-            style::mix(BG, CYAN, 0.22)
-        } else {
-            BG
-        };
+        let bg = bg_for(i);
 
         let mut j = i + 1;
         while j < row.end {
@@ -183,23 +193,7 @@ fn draw_row(
             } else {
                 break
             };
-            let next_hit = hits.iter().any(|(a, b)| j >= *a && j < *b);
-            let next_sel = selected.is_some_and(|(a, b)| {
-                (row.line > a.line || (row.line == a.line && j >= a.col))
-                    && (row.line < b.line || (row.line == b.line && j < b.col))
-            });
-            let next_bg = if next_hit {
-                style::mix(BG, AMBER, 0.38)
-            } else if next_sel {
-                style::mix(BG, MAGENTA, 0.32)
-            } else if voice_span.is_some_and(|s| in_sentence(s, row.line, j)) {
-                style::mix(BG, GREEN, 0.28)
-            } else if row.line == r.cursor.line && j == r.cursor.col {
-                style::mix(BG, CYAN, 0.22)
-            } else {
-                BG
-            };
-            if next != fg || next_bg != bg || x + run_width(&text[i..j]) >= cols {
+            if next != fg || bg_for(j) != bg || x + run_width(&text[i..j]) >= cols {
                 break;
             }
             j += 1;
@@ -217,6 +211,12 @@ fn draw_row(
 /// Whether a char position falls inside the sentence being spoken. Both ends
 /// are exclusive/inclusive as stored: `start` is the first word, `end` is one
 /// past the last.
+/// Whether a char sits in `[a, b)` across one or more display lines.
+fn in_range(a: super::Pos, b: super::Pos, line: usize, col: usize) -> bool {
+    let at = (line, col);
+    (a.line, a.col) <= at && at < (b.line, b.col)
+}
+
 fn in_sentence(s: &crate::voice::Sentence, line: usize, col: usize) -> bool {
     if line < s.start.0 || line > s.end.0 {
         return false;
@@ -311,9 +311,12 @@ const HELP: &[(&str, &str)] = &[
     ("n · N", "next / previous match"),
     ("v · y", "start selection · copy it"),
     ("yy", "copy the current line"),
-    ("space", "read aloud / pause"),
+    ("space", "read aloud / pause / resume"),
     ("s · < · >", "stop · prev / next sentence"),
     ("[ · ] · V", "slower / faster · toggle voice"),
+    (":rate N", "set words per minute"),
+    (":voice NAME", "switch neural voice"),
+    (":preview", "hear the selected voice"),
     (":e PATH", "open another document"),
     ("q · esc", "leave reader · cancel a prompt"),
 ];

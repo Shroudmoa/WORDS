@@ -56,6 +56,7 @@ const OFFSET_REFRESH: Duration = Duration::from_secs(60);
 struct Args {
     help: bool,
     list: bool,
+    voice_doctor: bool,
     seed: u64,
     words: Option<String>,
     lang: Option<String>,
@@ -91,6 +92,7 @@ fn parse() -> Result<Args, String> {
     let mut a = Args {
         help: false,
         list: false,
+        voice_doctor: false,
         seed: 0x5EED_1337,
         words: None,
         lang: None,
@@ -109,6 +111,7 @@ fn parse() -> Result<Args, String> {
         match arg.as_str() {
             "-h" | "--help" => a.help = true,
             "-l" | "--list" => a.list = true,
+            "-D" | "--voice-doctor" => a.voice_doctor = true,
             "-i" | "--stdin" => a.stdin = true,
             "-s" | "--seed" => {
                 a.seed = it
@@ -176,6 +179,7 @@ fn usage() {
         --todo          start on the todo list
         --plan          start on the day planner
     -l, --list          print the built-in phrases and exit
+    -D, --voice-doctor  check Python, edge-tts, audio players and settings
     -h, --help          this text
 
   MODES
@@ -208,25 +212,32 @@ fn usage() {
     position in each document is remembered under ~/.config/words/positions.
 
    VOICE
-    Words speaks a new phrase as it appears, and Reader can read a document
-    aloud with the current sentence tinted as it goes. No audio library is
-    built in: it uses espeak-ng / espeak, say, spd-say or, failing those, a
-    Python gTTS fallback (with ffplay, mpg123, afplay or cvlc).
-    Settings live in:
+    Neural voices by default. Words speaks each phrase as it appears and
+    Reader follows along word by word using real synthesiser timings. Rust
+    stays dependency-free; synthesis is a small embedded Python helper:
+
+        python3 -m pip install edge-tts
+        words --voice-doctor        # tells you exactly what is missing
+
+    Audio needs a player: ffplay, mpg123, paplay, aplay or afplay.
+    `say` / `espeak` / `spd-say` / `piper` are explicit fallbacks, not the
+    default. Settings live in:
 
         {dir}/voice
 
-        enabled=true    master switch (v toggles it while running)
-        reader=true     speak documents in Reader Mode
-        words=true      speak each typewriter phrase
-        backend=auto    auto / espeak / say / spd-say / gtts / none
-        voice=          optional voice name or language
-        rate=175        words per minute
-        volume=100      percentage
-        lang=en         language code for gTTS
+        enabled=true                master switch (v toggles it while running)
+        reader=true                 speak documents in Reader Mode
+        words=true                  speak each typewriter phrase
+        backend=edge                edge / piper / say / espeak / spd-say / none
+        voice=en-US-AvaNeural       Edge voice name, or a Piper .onnx path
+        rate=175                    words per minute
+        volume=100                  percentage
+        pitch=+0Hz                  Edge pitch, e.g. -3Hz
+        lang=en-US                  language hint
 
-    In Reader: space reads / pauses, s stops, < and > step a sentence,
-    [ and ] change speed, V toggles voice, and :rate N sets words per minute.
+    In Reader: space pauses/resumes at the exact word, s stops, < and > jump
+    a sentence, [ and ] change speed, V toggles voice, :rate N sets WPM,
+    :voice NAME switches neural voice, and :preview speaks a sample.
 
   COUNTER
         words --timer          a 25:00 countdown, armed and waiting
@@ -344,6 +355,10 @@ fn main() {
         }
         return;
     }
+    if args.voice_doctor {
+        println!("{}", voice::doctor());
+        return;
+    }
 
     // A bad document path is reported on a normal stderr, before raw mode:
     // Reader Mode has nothing to show until a file has been opened.
@@ -388,15 +403,16 @@ fn main() {
     // The config directory is where reading positions are kept; make sure it
     // exists before a document tries to restore one.
     let _ = config::ensure_dir();
-    // One worker for the typewriter's phrases; the reader owns its own so each
-    // mode can highlight what it is saying. Both read the same config file.
-    let mut voice = voice::Voice::new(voice::Config::load());
+    // One worker for the whole process. Reader gets a cloneable handle rather
+    // than a second synthesiser, so toggles and playback state are shared.
+    let voice = voice::Voice::new(voice::Config::load());
 
     let (cols, rows) = tty.size();
     let mut e = engine::Engine::new(args.seed, cols, rows);
     // Reader state lives beside the engine, not inside it: the typewriter
     // knows only that another mode is on screen.
-    let mut doc_reader = reader::Reader::new(cols as usize, rows as usize);
+    let mut doc_reader =
+        reader::Reader::with_voice(cols as usize, rows as usize, voice.clone());
     if let Some(p) = &args.read {
         if let Err(err) = doc_reader.open(Path::new(p)) {
             eprintln!("words: {err}");
@@ -1040,6 +1056,7 @@ mod tests {
         Args {
             help: false,
             list: false,
+            voice_doctor: false,
             seed: 1,
             words: words.map(String::from),
             lang: lang.map(String::from),

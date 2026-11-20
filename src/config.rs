@@ -129,6 +129,12 @@ pub fn voice_file() -> Option<PathBuf> {
     dir().map(|d| d.join("voice"))
 }
 
+/// Where synthesised audio and its word timings are cached, keyed by text and
+/// voice. Repeating a phrase or document should not hit the network twice.
+pub fn voice_cache_dir() -> Option<PathBuf> {
+    dir().map(|d| d.join("voice-cache"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
